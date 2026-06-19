@@ -1,5 +1,157 @@
 # @hyperdx/common-utils
 
+## 0.21.0
+
+### Minor Changes
+
+- e03971b0: refactor(theme): rename chart palette tokens from chart-1..10 to hue-named
+  (chart-blue, chart-orange, ...) and unify the categorical palette across HyperDX
+  and ClickStack
+
+  Stored configs from the initial color picker (#2265) keep working.
+  `ChartPaletteTokenSchema` stays strict (a plain `z.enum`, so its `z.input`
+  matches `z.output` — wrapping it in `z.preprocess` would poison
+  `validateRequest`'s `req.body` inference all the way up to
+  `Dashboard.tiles[i].config.color`). Migration of legacy `chart-1` .. `chart-10`
+  happens at five complementary points so no entry or wire-format path can slip
+  through, all composing over a single shared walker
+  (`walkRawDashboardTileColors` in `common-utils`) so the per-tile traversal
+  stays in lockstep:
+
+  - **Fetch-time / write-time (React)**: `normalizeDashboardTileColors` in
+    `packages/app/src/dashboard.ts` heals dashboards on read
+    (`useDashboards` / `fetchLocalDashboards` / `fetchDashboards`) and on write
+    (`useUpdateDashboard` / `useCreateDashboard`). Unresolvable color strings
+    (stale hexes, hand-edited values, forward-rolled future tokens) are
+    preserved so the user's chosen value survives a render pass — the strict
+    server-side schema surfaces a clear error on next save instead of the
+    normalizer quietly dropping the field.
+  - **JSON import**: `DBDashboardImportPage` runs
+    `normalizeRawDashboardTileColors` on the parsed JSON _before_ the strict
+    `DashboardTemplateSchema.safeParse`, so templates exported from a
+    pre-rename deploy import cleanly.
+  - **Server-side GET response healing**: `getDashboards` / `getDashboard` in
+    `packages/api/src/controllers/dashboard.ts` rewrite legacy tile colors on
+    the way out. Pre-rename Mongo docs are served on the wire as
+    hue-named tokens so non-React HTTP clients (CI scripts, stale bundle
+    tabs during a rolling deploy, the external API) can round-trip
+    GET → PATCH without ever resurrecting `chart-N` through the strict
+    schema.
+  - **Server-side write shim**: the dashboards POST / PATCH routes mount
+    a request-body preprocessor that rewrites legacy tile colors before
+    `validateRequest` runs `ChartPaletteTokenSchema`. Catches non-React
+    HTTP callers (stale-bundle tabs during a rolling deploy, CI scripts,
+    MCP, the upcoming external-API parity work) for a one-release
+    deprecation window without weakening the schema's input/output equality.
+    The dashboard provisioner task applies the same shim before parsing
+    on-disk template files.
+  - **Render-time (belt-and-suspenders)**: `DBNumberChart` and
+    `ColorSwatchInput` also call `resolveChartPaletteToken` for tiles
+    constructed in memory between fetch and save (`ChartEditor` form
+    state, unit-test fixtures, hand-rolled `Tile` literals).
+
+  The migration preserves the HyperDX slot ordering from #2265 (slot 1 = brand
+  green, slot 2 = blue, etc.).
+
+  **ClickStack legacy color caveat:** Pre-rename ClickStack used a different slot
+  ordering than HyperDX (`--color-chart-1` was brand blue `#437eef`, not brand
+  green). The migration map uses HyperDX slot ordering, so any ClickStack
+  dashboard saved via #2265 with `color: 'chart-1'` will flip from blue to
+  Observable green after migration. We chose this trade-off deliberately over
+  branching the legacy map by active theme: `LEGACY_CHART_PALETTE_TOKEN_MAP` lives
+  in `common-utils` (shared with the API), and migration is one-shot persisted on
+  next save — theme-branching would couple common-utils to browser DOM state and
+  still produce wrong results for users whose active theme changed since the
+  original pick. Affected users can manually re-pick the desired hue via the (now
+  hue-labeled) color picker.
+
+  The categorical palette is based on Observable 10, with `chart-blue` swapped to
+  `#437eef` to match the brand link color
+  (`--click-global-color-text-link-default`); all other hues are straight from
+  Observable 10. The palette resolves identically on both themes — picking
+  `chart-blue` always renders the brand blue. Brand identity for charts moves
+  entirely into the semantic layer: `--color-chart-success` and `--color-chart-info`
+  resolve to categorical `chart-green` (`#3ca951`) and `chart-blue` (`#437eef`) on
+  both HyperDX and ClickStack, so success fills, info-level logs, and the
+  matching multi-series slots all read consistently across brands.
+
+  Internally, JS (`CATEGORICAL_HEX_BY_TOKEN` in `packages/app/src/utils.ts`) is
+  the source of truth for categorical hues — `getColorFromCSSVariable` and
+  `getColorFromCSSToken` skip `getComputedStyle` for categorical tokens since the
+  palette is unified across themes. The matching `--color-chart-{hue}` CSS vars in
+  `_tokens.scss` remain as a stylesheet-author affordance (inline `var()` use,
+  devtools inspection) and a hook for any future per-brand override. Semantic
+  tokens still resolve through `getComputedStyle` because they genuinely vary per
+  theme.
+
+### Patch Changes
+
+- 998ea5d0: feat: Add option to fit time chart y-axis lower bound
+- ee907386: fix: Add sourceId to MCP Raw SQL Tile schema
+- 8261b461: fix: inline parametric aggregate function arguments instead of passing as query parameters
+- bf6e1f29: feat(charts): the time-chart series limit is now configured per chart in the Display Settings drawer instead of as a workspace-wide team setting (the team "Time Chart Series Limit" setting is removed). It is disabled by default — charts fetch every series and no `__hdx_series_limit` CTE is emitted — and is cleared back to disabled by emptying the field. The control only appears for builder line/bar charts; the limit and its Generated SQL preview now come from the chart's own config. When a limit is set, chunked time-chart queries keep a consistent top-N series set: previously each time-window chunk ranked its own top-N, so charts could render more series than the limit and adjacent windows disagreed; the ranking is now pinned to the newest chunk window for every chunk so the union across chunks equals the limit.
+- 677e3f71: fix: Skip rendering empty aggConditions
+- 89949b1b: Adding filters to dashboard exports. Implemented validation on dashboard imports to catch potential issues with generated JSON or manually tweaked JSON.
+- 747352f3: feat: add direct_read optimization for filters
+- 750b8afe: feat(mcp): add denoise option to clickstack_search tool
+
+  Add a `denoise` boolean parameter to the MCP `clickstack_search` tool that
+  automatically filters out high-frequency repetitive event patterns from
+  search results, mirroring the web app's "Denoise Results" feature.
+
+  When enabled, the tool samples 10k random events, mines patterns using
+  the Drain algorithm, identifies noisy patterns (>10% of sample), and
+  filters them out of result rows. Returns filtered rows plus metadata
+  listing removed patterns with estimated counts.
+
+  Extracts shared denoise constants (`DENOISE_SAMPLE_SIZE`,
+  `DENOISE_NOISE_THRESHOLD`) into `@hyperdx/common-utils` so the web app
+  and MCP server use the same values.
+
+- caba7c25: fix: Nudge agents towards macros in raw SQL tiles
+- adac913d: refactor(mcp): rename all MCP tool prefixes from `hyperdx_` to `clickstack_`
+
+  Rename the MCP server name from `hyperdx` to `clickstack` and update all 19
+  tool names (e.g. `hyperdx_search` → `clickstack_search`), along with
+  descriptions, prompts, error messages, and test references.
+
+- c74744a5: fix: fallback to body or implicit column expression when other empty
+- 03f9dd70: feat: add an optional Section field to data sources
+
+  Sources can now carry an optional free-text Section label, set from the source
+  settings form. The value is persisted and returned by GET /api/v2/sources, so
+  external API consumers can read it. This lays the groundwork for grouping and
+  searching sources by section in the source selector.
+
+- 81e524c2: feat(charts): cap group-by time charts to a top-N series limit to prevent browser memory exhaustion on high-cardinality group-bys. The cap defaults to 100 (the number of series rendered) and is configurable per team via a new "Time Chart Series Limit" setting; series beyond the cap remain available in the series selector.
+- 55a255a0: refactor(metrics): unify AttributesHash to variadic cityHash64 across Map and
+  JSON metric schemas
+
+  Sum / Gauge / Histogram metric queries now compute AttributesHash as
+  `cityHash64(ScopeAttributes, ResourceAttributes, Attributes)` for both
+  Map(LowCardinality(String), String) and JSON attribute columns. Previously
+  the Map-schema path wrapped the three maps in `mapConcat()` before hashing,
+  and the JSON-schema path used the variadic form; the schema-detection
+  ClickHouse round-trip and the `attrHashExpr` helper / `isJsonSchema`
+  plumbing are gone.
+
+  Compatibility:
+
+  - Per-row AttributesHash values change for every Map-schema metric row,
+    but the hash is recomputed inside CTEs on every query — no materialized
+    view, projection, ALIAS column, or cache persists it, so no downstream
+    consumer is affected (audit: OSS only).
+  - Cross-scope same-key behaviour shifts: two rows that carry the same
+    logical key in different attribute scopes (e.g. `host` in
+    `ResourceAttributes` for one emission and `host` in `Attributes` for the
+    next) now hash distinctly and land in separate series. Previously the
+    mapConcat path collapsed them into one series. This only matters when an
+    OTel collector processor promotes attributes across scopes mid-stream;
+    most SDKs emit attributes in stable scopes. The new behaviour is captured
+    by an integration test in `packages/api/src/clickhouse/__tests__`.
+
+  HDX-4466.
+
 ## 0.20.0
 
 ### Minor Changes
