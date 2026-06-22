@@ -5,6 +5,10 @@ import { serializeError } from 'serialize-error';
 
 import * as config from '@/config';
 import { findUserByAccessKey } from '@/controllers/user';
+import {
+  establishProxyAuthSession,
+  hasProxyAuthSession,
+} from '@/middleware/proxyHeaderAuth';
 import type { UserDocument } from '@/models/user';
 import {
   getActiveTraceId,
@@ -152,6 +156,17 @@ export function isUserAuthenticated(
       ...getStaticFeatureFlags(),
     });
     return nextWithQueryAttribution(req, next);
+  }
+
+  // gascity fork: reverse-proxy (forward-auth) SSO -- see proxyHeaderAuth.ts and
+  // GASCITY-FORK.md. In proxy mode the gate-vouched identity is the only
+  // credential: unless the session already belongs to it, (re)establish the
+  // session for it (or 401), then re-enter here to take the stock
+  // authenticated path below. Inert when PROXY_AUTH_ENABLED is unset.
+  if (config.IS_PROXY_AUTH_ENABLED && !hasProxyAuthSession(req)) {
+    return establishProxyAuthSession(req, res, next, () =>
+      isUserAuthenticated(req, res, next),
+    );
   }
 
   if (req.isAuthenticated()) {
