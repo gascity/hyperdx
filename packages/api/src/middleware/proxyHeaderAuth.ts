@@ -22,13 +22,21 @@ import Team from '@/models/team';
 import User, { type UserDocument } from '@/models/user';
 import logger from '@/utils/logger';
 
-// Rejects obviously malformed values (a comma => multi-valued header, plus any
-// whitespace or control char, which could spawn a ghost user that differs only
-// by invisible bytes) before a DB lookup. This is hygiene, NOT the security
-// control -- the gate asserts the authoritative, already-authenticated address.
-// eslint-disable-next-line no-control-regex
-const EMAIL_RE =
-  /^[^\s@,\x00-\x1f\x7f]+@[^\s@,\x00-\x1f\x7f]+\.[^\s@,\x00-\x1f\x7f]+$/;
+// Rejects obviously malformed values (a comma => a multi-valued header) before a
+// DB lookup. This is hygiene, NOT the security control -- the gate asserts the
+// authoritative, already-authenticated address.
+const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
+
+// Control chars (\x00-\x1f, \x7f) aren't all matched by \s, and a ghost user
+// differing from a real one only by an invisible byte is a real vector. Checked
+// in code (not the regex) to avoid a no-control-regex lint carve-out.
+function hasControlChar(s: string): boolean {
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code <= 0x1f || code === 0x7f) return true;
+  }
+  return false;
+}
 
 function sharedSecretOk(req: Request): boolean {
   const expected = config.PROXY_AUTH_SHARED_SECRET;
@@ -52,7 +60,7 @@ export function getProxyAuthEmail(req: Request): string | null {
   const raw = req.get(config.PROXY_AUTH_HEADER);
   if (!raw) return null;
   const email = raw.trim().toLowerCase();
-  if (!email || !EMAIL_RE.test(email)) return null;
+  if (!email || hasControlChar(email) || !EMAIL_RE.test(email)) return null;
   return email;
 }
 
