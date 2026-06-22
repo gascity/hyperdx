@@ -32,7 +32,12 @@ jest.mock('@/models/team', () => ({
 }));
 jest.mock('@/utils/logger', () => ({
   __esModule: true,
-  default: { info: jest.fn(), warn: jest.fn(), error: jest.fn(), debug: jest.fn() },
+  default: {
+    info: jest.fn(),
+    warn: jest.fn(),
+    error: jest.fn(),
+    debug: jest.fn(),
+  },
 }));
 
 const cfg = config as unknown as {
@@ -96,7 +101,9 @@ describe('getProxyAuthEmail', () => {
       'a b@gascity.com',
       'a@gascity',
     ]) {
-      expect(getProxyAuthEmail(reqWith({ 'x-auth-request-email': v }))).toBeNull();
+      expect(
+        getProxyAuthEmail(reqWith({ 'x-auth-request-email': v })),
+      ).toBeNull();
     }
   });
 

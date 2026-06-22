@@ -27,7 +27,8 @@ import logger from '@/utils/logger';
 // by invisible bytes) before a DB lookup. This is hygiene, NOT the security
 // control -- the gate asserts the authoritative, already-authenticated address.
 // eslint-disable-next-line no-control-regex
-const EMAIL_RE = /^[^\s@,\x00-\x1f\x7f]+@[^\s@,\x00-\x1f\x7f]+\.[^\s@,\x00-\x1f\x7f]+$/;
+const EMAIL_RE =
+  /^[^\s@,\x00-\x1f\x7f]+@[^\s@,\x00-\x1f\x7f]+\.[^\s@,\x00-\x1f\x7f]+$/;
 
 function sharedSecretOk(req: Request): boolean {
   const expected = config.PROXY_AUTH_SHARED_SECRET;
