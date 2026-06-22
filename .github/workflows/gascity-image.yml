@@ -41,12 +41,14 @@ jobs:
       - name: Typecheck (api)
         run: yarn workspace @hyperdx/api exec tsc --noEmit
       - name: Unit tests (proxy-auth + config regression)
-        # Anchored patterns so we run ONLY the two DB-free unit suites (a bare
-        # "config" would also match renderChartConfig.test.ts, which needs CH/Mongo).
+        # Anchored regex passed positionally (= testPathPattern, version-agnostic;
+        # jest renamed the --testPathPattern flag) so we run ONLY the two DB-free
+        # unit suites; a bare "config" would also match renderChartConfig.test.ts,
+        # which needs CH/Mongo.
         run: >-
           DOTENV_CONFIG_PATH=.env.test
           yarn workspace @hyperdx/api exec jest --runInBand --ci --forceExit
-          --testPathPattern '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
+          '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
 
   build:
     name: build prod image + symbol guard + push
