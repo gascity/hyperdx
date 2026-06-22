@@ -45,6 +45,49 @@ export const RUN_SCHEDULED_TASKS_EXTERNALLY =
 export const IS_LOCAL_APP_MODE =
   env.IS_LOCAL_APP_MODE === 'DANGEROUSLY_is_local_app_mode💀';
 
+// gascity fork: reverse-proxy (forward-auth) SSO. See GASCITY-FORK.md.
+// Trust an identity header set by a trusted upstream gate (oauth2-proxy in front
+// of Authentik) and find-or-create the matching user, so SSO is the only login.
+//
+// SECURITY: the trust boundary is the EDGE. The gate MUST strip any
+// client-supplied PROXY_AUTH_HEADER / PROXY_AUTH_SECRET_HEADER on inbound and
+// re-set them only after a successful SSO, AND a NetworkPolicy MUST ensure only
+// the gate can reach this port. PROXY_AUTH_SHARED_SECRET is a strong in-app
+// backstop (a value the browser never sees); PROXY_AUTH_ALLOWED_EMAIL_DOMAINS is
+// defense-in-depth, NOT the primary control. With PROXY_AUTH_ENABLED unset, all
+// of this is inert and stock auth behavior is unchanged.
+export const IS_PROXY_AUTH_ENABLED = env.PROXY_AUTH_ENABLED === 'true';
+export const PROXY_AUTH_HEADER = (
+  env.PROXY_AUTH_HEADER || 'x-auth-request-email'
+).toLowerCase();
+export const PROXY_AUTH_ALLOWED_EMAIL_DOMAINS = (
+  env.PROXY_AUTH_ALLOWED_EMAIL_DOMAINS || ''
+)
+  .split(',')
+  .map(d => d.trim().toLowerCase())
+  .filter(Boolean);
+export const PROXY_AUTH_SHARED_SECRET = env.PROXY_AUTH_SHARED_SECRET || '';
+export const PROXY_AUTH_SECRET_HEADER = (
+  env.PROXY_AUTH_SECRET_HEADER || 'x-hdx-proxy-auth-secret'
+).toLowerCase();
+// Where /api/logout sends the user under proxy auth: clearing only the HyperDX
+// session is futile (the gate re-mints it), so bounce to the gate's sign-out.
+// Defaults to oauth2-proxy's sign-out on this host; set the full URL (with ?rd=)
+// for a true IdP logout.
+export const PROXY_AUTH_LOGOUT_URL =
+  env.PROXY_AUTH_LOGOUT_URL || '/oauth2/sign_out';
+
+// Fail closed: proxy auth without the in-app shared-secret backstop reduces to
+// header-only trust if the edge ever mis-strips an inbound header. Refuse to
+// start in that posture rather than silently degrade.
+if (IS_PROXY_AUTH_ENABLED && !PROXY_AUTH_SHARED_SECRET) {
+  throw new Error(
+    'PROXY_AUTH_ENABLED=true requires PROXY_AUTH_SHARED_SECRET to be set ' +
+      '(in-app backstop for an edge header-strip misconfig). ' +
+      'Refusing to start in header-only-trust mode.',
+  );
+}
+
 // Only used to bootstrap empty instances
 export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;
 export const DEFAULT_SOURCES = env.DEFAULT_SOURCES;

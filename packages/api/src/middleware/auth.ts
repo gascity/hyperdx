@@ -5,6 +5,10 @@ import { serializeError } from 'serialize-error';
 
 import * as config from '@/config';
 import { findUserByAccessKey } from '@/controllers/user';
+import {
+  getProxyAuthEmail,
+  proxyHeaderAuth,
+} from '@/middleware/proxyHeaderAuth';
 import type { UserDocument } from '@/models/user';
 import logger from '@/utils/logger';
 
@@ -114,6 +118,40 @@ export function isUserAuthenticated(
       team: '_local_team_',
     };
     return next();
+  }
+
+  // gascity fork: reverse-proxy (forward-auth) SSO. Honor an identity asserted
+  // by a trusted upstream gate so SSO is the only login. The header's trust
+  // boundary is the EDGE (the gate strips any client-supplied value + a
+  // NetworkPolicy pins this port to the gate; an optional shared secret adds an
+  // in-app proof) -- see PROXY_AUTH_* in config.ts and GASCITY-FORK.md.
+  // getProxyAuthEmail() returns null whenever proxy auth is disabled, so stock
+  // behavior is unchanged.
+  const proxyEmail = getProxyAuthEmail(req);
+  if (proxyEmail) {
+    // Fast path: an existing session already belongs to this same identity.
+    if (
+      req.isAuthenticated() &&
+      req.user?.email?.toLowerCase() === proxyEmail
+    ) {
+      setTraceAttributes({
+        userId: req.user?._id.toString(),
+        userEmail: req.user?.email,
+      });
+      return next();
+    }
+    // No session yet, or it belongs to a different identity than the gate now
+    // asserts -> (re)establish the session as the gate-asserted user.
+    proxyHeaderAuth(req, res, next, proxyEmail).catch(next);
+    return;
+  }
+
+  // Proxy-auth mode: every request must carry a gate-vouched identity. Never
+  // honor a bare session here -- a stolen or long-lived cookie must not outlive
+  // the gate's session or an Authentik revocation. getProxyAuthEmail() returned
+  // null, so the gate did not vouch for this request.
+  if (config.IS_PROXY_AUTH_ENABLED) {
+    return res.sendStatus(401);
   }
 
   if (req.isAuthenticated()) {
