@@ -130,7 +130,10 @@ export function isUserAuthenticated(
   const proxyEmail = getProxyAuthEmail(req);
   if (proxyEmail) {
     // Fast path: an existing session already belongs to this same identity.
-    if (req.isAuthenticated() && req.user?.email?.toLowerCase() === proxyEmail) {
+    if (
+      req.isAuthenticated() &&
+      req.user?.email?.toLowerCase() === proxyEmail
+    ) {
       setTraceAttributes({
         userId: req.user?._id.toString(),
         userEmail: req.user?.email,
@@ -141,6 +144,14 @@ export function isUserAuthenticated(
     // asserts -> (re)establish the session as the gate-asserted user.
     proxyHeaderAuth(req, res, next, proxyEmail).catch(next);
     return;
+  }
+
+  // Proxy-auth mode: every request must carry a gate-vouched identity. Never
+  // honor a bare session here -- a stolen or long-lived cookie must not outlive
+  // the gate's session or an Authentik revocation. getProxyAuthEmail() returned
+  // null, so the gate did not vouch for this request.
+  if (config.IS_PROXY_AUTH_ENABLED) {
+    return res.sendStatus(401);
   }
 
   if (req.isAuthenticated()) {

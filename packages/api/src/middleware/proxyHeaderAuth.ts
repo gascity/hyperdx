@@ -14,7 +14,6 @@
 // never sees, so it survives an edge header-strip misconfig). The email-domain
 // allowlist is defense-in-depth, never the primary control.
 import crypto from 'crypto';
-
 import type { NextFunction, Request, Response } from 'express';
 
 import * as config from '@/config';
@@ -23,9 +22,12 @@ import Team from '@/models/team';
 import User, { type UserDocument } from '@/models/user';
 import logger from '@/utils/logger';
 
-// Rejects obviously malformed values (and any comma, i.e. a multi-valued header)
-// before a DB lookup. This is hygiene, NOT the security control.
-const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
+// Rejects obviously malformed values (a comma => multi-valued header, plus any
+// whitespace or control char, which could spawn a ghost user that differs only
+// by invisible bytes) before a DB lookup. This is hygiene, NOT the security
+// control -- the gate asserts the authoritative, already-authenticated address.
+// eslint-disable-next-line no-control-regex
+const EMAIL_RE = /^[^\s@,\x00-\x1f\x7f]+@[^\s@,\x00-\x1f\x7f]+\.[^\s@,\x00-\x1f\x7f]+$/;
 
 function sharedSecretOk(req: Request): boolean {
   const expected = config.PROXY_AUTH_SHARED_SECRET;
@@ -67,11 +69,18 @@ async function findOrCreateUser(
   try {
     // Passwordless: no salt/hash, so /login/password can never authenticate
     // these users -- they exist only to back the gate-asserted session.
-    return (await User.create({
+    const created = (await User.create({
       email,
       name: email,
       team: teamId,
     })) as UserDocument;
+    // Distinct, structured event: a brand-new identity was just admitted by the
+    // gate -- auditable separately from a normal returning-user login.
+    logger.warn(
+      { email, type: 'user_provision', authType: 'proxy' },
+      'proxy-auth: provisioned a new user from the gate-asserted identity',
+    );
+    return created;
   } catch (err: any) {
     // Lost a create race against a concurrent first request from the same user
     // (unique email index). The winner created it; re-read.

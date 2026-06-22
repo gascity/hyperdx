@@ -68,10 +68,13 @@ established, `/api/me` returns 200 and the bounce never fires.
 | `PROXY_AUTH_ENABLED` | `false` | master switch; unset = stock HyperDX |
 | `PROXY_AUTH_HEADER` | `x-auth-request-email` | header the gate sets to the SSO email |
 | `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS` | `` (deny-all) | comma-separated domains allowed to auto-provision |
-| `PROXY_AUTH_SHARED_SECRET` | `` (off) | if set, the request must also carry the secret header |
+| `PROXY_AUTH_SHARED_SECRET` | `` | **required when enabled** — the app refuses to start without it; the request must carry it in the secret header |
 | `PROXY_AUTH_SECRET_HEADER` | `x-hdx-proxy-auth-secret` | header carrying the shared secret |
+| `PROXY_AUTH_LOGOUT_URL` | `/oauth2/sign_out` | where `/api/logout` sends the user under proxy auth (the gate's sign-out) |
 
-Break-glass password login (`/login/password`) is intentionally left intact.
+Break-glass password login (`/login/password`) is left intact in code, but note
+it is only reachable *behind* the gate and the gate identity wins on the next
+request — so the real break-glass is flipping `PROXY_AUTH_ENABLED` off.
 
 ## ⚠️ Security model — the trust boundary is the EDGE
 
@@ -86,8 +89,26 @@ safe. Deployments MUST:
 2. **NetworkPolicy** so only the gate can reach the app port.
 3. **Set `PROXY_AUTH_SHARED_SECRET`** (injected by the gate, never exposed to the
    browser) as an in-app backstop that survives an edge header-strip misconfig.
+   This is **enforced**: the API refuses to start with proxy auth on and no
+   secret set. The patch also refuses to honor a session alone in proxy mode —
+   every request must carry a gate-vouched identity, so a stolen/long-lived
+   cookie cannot outlive the gate's session.
 4. **Scope `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS`** so the gate can't provision
-   arbitrary identities.
+   arbitrary identities, **and** bind the Authentik *application* to the right
+   group/policy — that binding is the **primary admission control** (who is
+   allowed in at all). The domain allowlist is only a coarse backstop.
 
-Note: OSS HyperDX has **no RBAC** — every user lands in the one shared team with
-identical permissions. *Who* is allowed in is an Authentik decision, not HyperDX.
+### Residual access vectors (know these)
+
+- **API access keys bypass the gate.** Every user (including auto-provisioned SSO
+  users) gets an `accessKey` (returned by `/me`). The `/api/v2` and `/mcp` Bearer
+  paths authenticate by that key and **do not transit the gate**, so they survive
+  an Authentik revocation. **Offboarding must delete the HyperDX user (or rotate
+  the key)**, not just disable the Authentik account.
+- **No RBAC.** OSS HyperDX has no roles — every user lands in the one shared team
+  with identical permissions. *Who* is allowed in is an Authentik decision, not
+  HyperDX. First-time provisioning is logged as a distinct `user_provision` event
+  for audit.
+- **Logout** clears the HyperDX session and bounces to `PROXY_AUTH_LOGOUT_URL`
+  (the gate sign-out); a true IdP logout needs that URL to chain to Authentik's
+  end-session endpoint.

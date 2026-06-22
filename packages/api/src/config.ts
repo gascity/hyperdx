@@ -70,6 +70,23 @@ export const PROXY_AUTH_SHARED_SECRET = env.PROXY_AUTH_SHARED_SECRET || '';
 export const PROXY_AUTH_SECRET_HEADER = (
   env.PROXY_AUTH_SECRET_HEADER || 'x-hdx-proxy-auth-secret'
 ).toLowerCase();
+// Where /api/logout sends the user under proxy auth: clearing only the HyperDX
+// session is futile (the gate re-mints it), so bounce to the gate's sign-out.
+// Defaults to oauth2-proxy's sign-out on this host; set the full URL (with ?rd=)
+// for a true IdP logout.
+export const PROXY_AUTH_LOGOUT_URL =
+  env.PROXY_AUTH_LOGOUT_URL || '/oauth2/sign_out';
+
+// Fail closed: proxy auth without the in-app shared-secret backstop reduces to
+// header-only trust if the edge ever mis-strips an inbound header. Refuse to
+// start in that posture rather than silently degrade.
+if (IS_PROXY_AUTH_ENABLED && !PROXY_AUTH_SHARED_SECRET) {
+  throw new Error(
+    'PROXY_AUTH_ENABLED=true requires PROXY_AUTH_SHARED_SECRET to be set ' +
+      '(in-app backstop for an edge header-strip misconfig). ' +
+      'Refusing to start in header-only-trust mode.',
+  );
+}
 
 // Only used to bootstrap empty instances
 export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;

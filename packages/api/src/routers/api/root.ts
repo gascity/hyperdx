@@ -142,6 +142,13 @@ router.get('/logout', (req, res, next) => {
     if (err) {
       return next(err);
     }
+    // gascity fork: under proxy auth the gate owns the real session; clearing
+    // only the HyperDX session is futile (the next guarded request re-mints it
+    // from the gate header). Bounce to the gate's sign-out so logout actually
+    // logs out. See GASCITY-FORK.md.
+    if (config.IS_PROXY_AUTH_ENABLED) {
+      return res.redirect(config.PROXY_AUTH_LOGOUT_URL);
+    }
     res.redirect(`${config.FRONTEND_REDIRECT_BASE}/login`);
   });
 });
