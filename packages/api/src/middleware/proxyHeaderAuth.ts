@@ -10,9 +10,10 @@
 //   1. the gate MUST strip any client-supplied identity/secret headers on
 //      inbound and re-set them only after a successful SSO; and
 //   2. a NetworkPolicy MUST ensure only the gate can reach this port.
-// PROXY_AUTH_SHARED_SECRET is a strong in-app backstop (a value the browser
-// never sees, so it survives an edge header-strip misconfig). The email-domain
-// allowlist is defense-in-depth, never the primary control.
+// The current and optional previous proxy secrets are a strong in-app backstop
+// (values the browser never sees, so they survive an edge header-strip
+// misconfig). The email-domain allowlist is defense-in-depth, never the primary
+// control.
 import crypto from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 
@@ -39,18 +40,26 @@ function hasControlChar(s: string): boolean {
 }
 
 function sharedSecretOk(req: Request): boolean {
-  const expected = config.PROXY_AUTH_SHARED_SECRET;
-  // No secret configured -> rely solely on the edge (header strip + netpol).
-  if (!expected) return true;
   const got = req.get(config.PROXY_AUTH_SECRET_HEADER) ?? '';
+  const currentMatches = secretEqual(got, config.PROXY_AUTH_SHARED_SECRET);
+  const previousMatches = secretEqual(
+    got,
+    config.PROXY_AUTH_SHARED_SECRET_PREVIOUS,
+  );
+  return currentMatches || previousMatches;
+}
+
+function secretEqual(got: string, expected: string): boolean {
+  if (!expected) return false;
   const a = Buffer.from(got);
   const b = Buffer.from(expected);
   // Length check first; timingSafeEqual throws on unequal lengths.
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// The gate-asserted email, iff proxy auth is enabled, the (optional) shared
-// secret matches, and the header carries exactly one well-formed address.
+// The gate-asserted email, iff proxy auth is enabled, a configured current or
+// previous secret matches, and the header carries exactly one well-formed
+// address.
 // Returns null otherwise, so the identity header is ignored and the caller
 // falls back to normal session / 401 handling. Returns null when proxy auth is
 // disabled, which keeps stock behavior byte-for-byte.

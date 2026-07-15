@@ -69,6 +69,7 @@ established, `/api/me` returns 200 and the bounce never fires.
 | `PROXY_AUTH_HEADER` | `x-auth-request-email` | header the gate sets to the SSO email |
 | `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS` | `` (deny-all) | comma-separated domains allowed to auto-provision |
 | `PROXY_AUTH_SHARED_SECRET` | `` | **required when enabled** — the app refuses to start without it; the request must carry it in the secret header |
+| `PROXY_AUTH_SHARED_SECRET_PREVIOUS` | `` | optional prior value accepted only during an attended rotation; when set, it must differ from the required current value |
 | `PROXY_AUTH_SECRET_HEADER` | `x-hdx-proxy-auth-secret` | header carrying the shared secret |
 | `PROXY_AUTH_LOGOUT_URL` | `/oauth2/sign_out` | where `/api/logout` sends the user under proxy auth (the gate's sign-out) |
 
@@ -90,9 +91,22 @@ safe. Deployments MUST:
 3. **Set `PROXY_AUTH_SHARED_SECRET`** (injected by the gate, never exposed to the
    browser) as an in-app backstop that survives an edge header-strip misconfig.
    This is **enforced**: the API refuses to start with proxy auth on and no
-   secret set. The patch also refuses to honor a session alone in proxy mode —
-   every request must carry a gate-vouched identity, so a stolen/long-lived
-   cookie cannot outlive the gate's session.
+   current secret set. The app rejects identical current and previous values.
+   Both values are read only at process startup; changing a Secret does not
+   update a running API process. Rotation is an attended sequence:
+
+   - deploy/restart every API instance with `PROXY_AUTH_SHARED_SECRET` set to the
+     new value and `PROXY_AUTH_SHARED_SECRET_PREVIOUS` set to the old value, then
+     prove readiness and that both values are accepted;
+   - converge every gate injector to the new value and prove each gate; then
+   - clear `PROXY_AUTH_SHARED_SECRET_PREVIOUS`, deploy/restart every API instance,
+     and prove the new value is accepted while the old value is rejected.
+
+   A one-replica `Recreate` deployment has a bounded interruption at each API
+   restart; the overlap prevents credential mismatch during gate convergence but
+   does not make those restarts zero-downtime. The patch also refuses to honor a
+   session alone in proxy mode — every request must carry a gate-vouched
+   identity, so a stolen/long-lived cookie cannot outlive the gate's session.
 4. **Scope `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS`** so the gate can't provision
    arbitrary identities, **and** bind the Authentik *application* to the right
    group/policy — that binding is the **primary admission control** (who is
