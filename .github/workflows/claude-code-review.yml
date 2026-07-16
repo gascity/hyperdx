@@ -1,165 +1,22 @@
-name: Claude Code Review
+# Disabled in the Gas City public fork.
+#
+# Re-enable only through a separate, reviewed design with:
+# - review input bound to the immutable PR head SHA;
+# - verification of the actor's actual repository write permission;
+# - a read-only model job; and
+# - an isolated comment-writer job that never checks out or executes PR code.
+name: Claude Code Review (disabled)
 
 on:
-  pull_request_target:
-    types: [opened, synchronize, ready_for_review]
   workflow_dispatch:
-    inputs:
-      pr_number:
-        description: Pull request number to review
-        required: true
-        type: string
-  # Optional: Only run on specific file changes
-  # paths:
-  #   - "src/**/*.ts"
-  #   - "src/**/*.tsx"
-  #   - "src/**/*.js"
-  #   - "src/**/*.jsx"
+
+permissions: {}
 
 jobs:
-  claude-review:
-    if:
-      github.event_name == 'workflow_dispatch' || github.event.action ==
-      'ready_for_review' || !github.event.pull_request.draft
-    # Optional: Filter by PR author
-    # if: |
-    #   github.event.pull_request.user.login == 'external-contributor' ||
-    #   github.event.pull_request.user.login == 'new-developer' ||
-    #   github.event.pull_request.author_association == 'FIRST_TIME_CONTRIBUTOR'
-
+  claude-review-disabled:
+    name: disabled by public-fork security policy
+    if: ${{ false }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-      issues: write
-      id-token: write
-      actions: read
-
     steps:
-      # Resolve the PR head repo/ref first so both pull_request_target and
-      # workflow_dispatch runs can checkout forked branches correctly.
-      - name: Resolve PR metadata
-        id: pr
-        uses: actions/github-script@v9
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const prNumber =
-              context.eventName === 'workflow_dispatch'
-                ? Number('${{ inputs.pr_number }}')
-                : context.payload.pull_request.number;
-
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: prNumber,
-            });
-
-            core.setOutput('number', String(pr.number));
-            core.setOutput('head_repo', pr.head.repo.full_name);
-            core.setOutput('head_ref', pr.head.ref);
-
-      # Checkout the fork's branch so Claude can read the actual PR code.
-      # Using the PR head repo/ref works for both fork and non-fork PRs.
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          repository: ${{ steps.pr.outputs.head_repo }}
-          ref: ${{ steps.pr.outputs.head_ref }}
-          fetch-depth: 0
-
-      - name: Run Claude Code Review
-        id: claude-review
-        uses: anthropics/claude-code-action@v1
-        with:
-          anthropic_api_key: ${{ secrets.ANTHROPIC_API_KEY }}
-          allowed_bots: dependabot,dependabot[bot],kodiakhq,kodiakhq[bot],github-actions,github-actions[bot],cursor,cursor[bot],claude,claude[bot]
-          github_token: ${{ secrets.GITHUB_TOKEN }} # Bypasses OIDC auth (required for pull_request_target)
-          allowed_non_write_users: '*' # Allows fork contributors to trigger reviews
-          prompt: |
-            REPO: ${{ github.repository }}
-            PR NUMBER: ${{ steps.pr.outputs.number }}
-
-            Please review this pull request. Use the repository's CLAUDE.md for guidance on style and conventions.
-
-            **IMPORTANT: Keep your review SHORT and ACTIONABLE.**
-
-            Format your review as a concise bulleted list focusing ONLY on:
-            - Critical bugs or security issues (if any)
-            - Important code quality issues or violations of project patterns
-            - Must-fix items before merge
-
-            Skip minor style nitpicks, explanations of obvious issues, and lengthy justifications unless critical.
-            Each item should be: **Issue** → **Fix** (one line each when possible).
-
-            Example format:
-            - ❌ Unvalidated user input in API endpoint → Add input validation
-            - ⚠️ Missing error handling in async function → Wrap in try-catch
-            - 🔒 Hardcoded credentials in config.ts → Move to environment variables
-
-            If there are NO critical issues, simply say "✅ No critical issues found."
-
-            Note: If the team wants a more thorough review, they can comment on the PR requesting one.
-
-            CRITICAL OUTPUT REQUIREMENTS:
-            1. Return a JSON object with a single "review" field whose VALUE
-               is a plain markdown STRING. Do NOT put another JSON object
-               inside the "review" string -- doing so posts raw JSON in the
-               comment instead of rendered markdown. The `review` value must
-               be markdown text only, not a stringified JSON envelope.
-            2. The review markdown must start with EXACTLY these two lines:
-               <!-- claude-code-review -->
-               ## PR Review
-            3. Do not post the review yourself using GitHub CLI or any comment tool.
-            4. The workflow will create or update the PR comment using your structured output.
-
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://docs.claude.com/en/docs/claude-code/sdk#command-line for available options
-          claude_args: |
-            --setting-sources user
-            --allowedTools "Bash(gh issue view:*),Bash(gh search:*),Bash(gh issue list:*),Bash(gh pr diff:*),Bash(gh pr view:*),Bash(gh pr list:*)"
-            --json-schema '{"type":"object","properties":{"review":{"type":"string","description":"Complete markdown review starting with <!-- claude-code-review --> on the first line and ## PR Review on the second line"}},"required":["review"]}'
-
-      - name: Find existing Claude review
-        uses: peter-evans/find-comment@v4
-        id: find-claude-comment
-        with:
-          issue-number: ${{ steps.pr.outputs.number }}
-          comment-author: github-actions[bot]
-          body-includes: '<!-- claude-code-review -->'
-          direction: last
-
-      # fromJSON() in a `with:` expression has been observed to leave the
-      # structured_output JSON string unparsed, posting the raw envelope as
-      # the comment body. Extract via jq.
-      #
-      # Defensive double-unwrap: the model has been observed to return
-      # `{"review": "{\"review\": \"<markdown>\"}"}` -- wrapping its own JSON
-      # output a second time so the comment body posts as raw JSON. Detect
-      # that case (the inner string parses as an object with a `review` key)
-      # and unwrap once more so we post markdown, not JSON. Mirrors the same
-      # fix applied to deep-review.yml.
-      - name: Extract review from structured output
-        id: extract-review
-        env:
-          STRUCTURED_OUTPUT:
-            ${{ steps.claude-review.outputs.structured_output }}
-        run: |
-          REVIEW="$(printf '%s' "$STRUCTURED_OUTPUT" | jq -r '.review')"
-          if printf '%s' "$REVIEW" | jq -e 'type == "object" and has("review")' >/dev/null 2>&1; then
-            REVIEW="$(printf '%s' "$REVIEW" | jq -r '.review')"
-          fi
-          {
-            echo 'review<<CLAUDE_REVIEW_EOF'
-            printf '%s' "$REVIEW"
-            echo
-            echo 'CLAUDE_REVIEW_EOF'
-          } >> "$GITHUB_OUTPUT"
-
-      - name: Post or update Claude review
-        uses: peter-evans/create-or-update-comment@v5
-        with:
-          comment-id: ${{ steps.find-claude-comment.outputs.comment-id }}
-          issue-number: ${{ steps.pr.outputs.number }}
-          body: ${{ steps.extract-review.outputs.review }}
-          edit-mode: replace
+      - name: Statically disabled
+        run: echo "Claude review is disabled in this public fork."
