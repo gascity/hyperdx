@@ -1,0 +1,70 @@
+# Gas City fork PR gate. This workflow intentionally has no secrets, package
+# write permission, registry login, or publish step: pull requests execute
+# author-controlled code.
+name: gascity-pr
+
+on:
+  pull_request:
+    branches: [gascity-sso]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gascity-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: auth quality gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Enable corepack (yarn 4)
+        run: corepack enable
+      - name: Install
+        run: yarn install --immutable
+      - name: Build common-utils (API typecheck depends on its declarations)
+        run: yarn workspace @hyperdx/common-utils run dev:build
+      - name: Lint API
+        run: yarn workspace @hyperdx/api run lint
+      - name: Typecheck API
+        run: yarn workspace @hyperdx/api exec tsc --noEmit
+      - name: Focused auth unit tests
+        # Anchored regex passed positionally (= testPathPattern) runs only the
+        # DB-free proxy-auth and config suites.
+        run: >-
+          DOTENV_CONFIG_PATH=.env.test yarn workspace @hyperdx/api exec jest
+          --runInBand --ci --forceExit
+          '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
+      - name: Build API production artifacts
+        run: yarn workspace @hyperdx/api run build
+      - name: Exact production-symbol guard
+        run: |
+          set -euo pipefail
+          for spec in \
+            packages/api/build/src/config.js:IS_PROXY_AUTH_ENABLED \
+            packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET \
+            packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+            packages/api/build/src/middleware/proxyHeaderAuth.js:timingSafeEqual \
+            packages/api/build/src/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+            packages/api/build/src/middleware/auth.js:proxyHeaderAuth
+          do
+            file="${spec%%:*}"
+            symbol="${spec#*:}"
+            if [ ! -f "$file" ]; then
+              echo "::error file=$file::production artifact is missing"
+              exit 1
+            fi
+            if ! grep -qF -- "$symbol" "$file"; then
+              echo "::error file=$file::required symbol $symbol is missing"
+              exit 1
+            fi
+            echo "ok: $symbol present in $file"
+          done
