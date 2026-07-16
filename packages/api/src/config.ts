@@ -53,7 +53,8 @@ export const IS_LOCAL_APP_MODE =
 // client-supplied PROXY_AUTH_HEADER / PROXY_AUTH_SECRET_HEADER on inbound and
 // re-set them only after a successful SSO, AND a NetworkPolicy MUST ensure only
 // the gate can reach this port. PROXY_AUTH_SHARED_SECRET is a strong in-app
-// backstop (a value the browser never sees); PROXY_AUTH_ALLOWED_EMAIL_DOMAINS is
+// backstop (values the browser never sees); one optional previous value permits
+// an attended rotation window. PROXY_AUTH_ALLOWED_EMAIL_DOMAINS is
 // defense-in-depth, NOT the primary control. With PROXY_AUTH_ENABLED unset, all
 // of this is inert and stock auth behavior is unchanged.
 export const IS_PROXY_AUTH_ENABLED = env.PROXY_AUTH_ENABLED === 'true';
@@ -67,6 +68,8 @@ export const PROXY_AUTH_ALLOWED_EMAIL_DOMAINS = (
   .map(d => d.trim().toLowerCase())
   .filter(Boolean);
 export const PROXY_AUTH_SHARED_SECRET = env.PROXY_AUTH_SHARED_SECRET || '';
+export const PROXY_AUTH_SHARED_SECRET_PREVIOUS =
+  env.PROXY_AUTH_SHARED_SECRET_PREVIOUS || '';
 export const PROXY_AUTH_SECRET_HEADER = (
   env.PROXY_AUTH_SECRET_HEADER || 'x-hdx-proxy-auth-secret'
 ).toLowerCase();
@@ -85,6 +88,16 @@ if (IS_PROXY_AUTH_ENABLED && !PROXY_AUTH_SHARED_SECRET) {
     'PROXY_AUTH_ENABLED=true requires PROXY_AUTH_SHARED_SECRET to be set ' +
       '(in-app backstop for an edge header-strip misconfig). ' +
       'Refusing to start in header-only-trust mode.',
+  );
+}
+if (
+  IS_PROXY_AUTH_ENABLED &&
+  PROXY_AUTH_SHARED_SECRET_PREVIOUS &&
+  PROXY_AUTH_SHARED_SECRET_PREVIOUS === PROXY_AUTH_SHARED_SECRET
+) {
+  throw new Error(
+    'PROXY_AUTH_SHARED_SECRET_PREVIOUS must differ from ' +
+      'PROXY_AUTH_SHARED_SECRET when proxy auth is enabled.',
   );
 }
 

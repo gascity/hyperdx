@@ -46,12 +46,13 @@ jobs:
         # unit suites; a bare "config" would also match renderChartConfig.test.ts,
         # which needs CH/Mongo.
         run: >-
-          DOTENV_CONFIG_PATH=.env.test
-          yarn workspace @hyperdx/api exec jest --runInBand --ci --forceExit
+          DOTENV_CONFIG_PATH=.env.test yarn workspace @hyperdx/api exec jest
+          --runInBand --ci --forceExit
           '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
 
   build:
     name: build prod image + symbol guard + push
+    needs: verify
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
@@ -87,15 +88,28 @@ jobs:
       - name: Symbol guard — the patch MUST be present in the built image
         run: |
           set -euo pipefail
-          for sym in IS_PROXY_AUTH_ENABLED proxyHeaderAuth PROXY_AUTH_SHARED_SECRET; do
-            if docker run --rm --entrypoint sh "${IMAGE}:ci-build" \
-                 -c "grep -rqF '$sym' /app/packages/api/build"; then
-              echo "ok: '$sym' present in /app/packages/api/build"
-            else
-              echo "::error::patch symbol '$sym' NOT found — refusing to publish a stock image"
-              exit 1
-            fi
-          done
+          docker run --rm --entrypoint sh "${IMAGE}:ci-build" -c '
+            set -eu
+            for spec in \
+              /app/packages/api/build/src/config.js:IS_PROXY_AUTH_ENABLED \
+              /app/packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET \
+              /app/packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+              /app/packages/api/build/src/middleware/proxyHeaderAuth.js:timingSafeEqual \
+              /app/packages/api/build/src/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+              /app/packages/api/build/src/middleware/auth.js:proxyHeaderAuth
+            do
+              file="${spec%%:*}"
+              symbol="${spec#*:}"
+              grep -qF "$symbol" "$file" || {
+                echo "patch symbol $symbol missing from $file" >&2
+                exit 1
+              }
+              echo "ok: $symbol present in $file"
+            done
+          ' || {
+            echo "::error::proxy-auth patch missing from production files — refusing to publish"
+            exit 1
+          }
       - name: Tag + push
         run: |
           set -euo pipefail
