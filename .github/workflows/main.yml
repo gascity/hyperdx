@@ -73,40 +73,50 @@ jobs:
   otel-unit-test:
     timeout-minutes: 8
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Get changed files
         id: changed-files
-        uses: tj-actions/changed-files@v47.0.6
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         with:
-          files: |
-            packages/otel-collector/**
+          base: ${{ github.ref_name }}
+          filters: |
+            otel:
+              - 'packages/otel-collector/**'
       - name: Setup Go
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: steps.changed-files.outputs.otel == 'true'
         uses: actions/setup-go@v5
         with:
           go-version-file: packages/otel-collector/go.mod
           cache-dependency-path: packages/otel-collector/go.sum
       - name: Run unit tests
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: steps.changed-files.outputs.otel == 'true'
         working-directory: ./packages/otel-collector
         run: go test ./...
   otel-smoke-test:
     timeout-minutes: 16
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Get changed OTEL collector files
         id: changed-files
-        uses: tj-actions/changed-files@v47.0.6
+        uses: dorny/paths-filter@fbd0ab8f3e69293af611ebaee6363fc25e6d187d # v4.0.1
         with:
-          files: |
-            docker/otel-collector/**
-            smoke-tests/otel-collector/**
+          base: ${{ github.ref_name }}
+          filters: |
+            otel:
+              - 'docker/otel-collector/**'
+              - 'smoke-tests/otel-collector/**'
       - name: Install required tooling
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: steps.changed-files.outputs.otel == 'true'
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
@@ -117,7 +127,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install --yes curl bats clickhouse-client
       - name: Run Smoke Tests
-        if: steps.changed-files.outputs.any_changed == 'true'
+        if: steps.changed-files.outputs.otel == 'true'
         working-directory: ./smoke-tests/otel-collector
         run: bats .
   e2e-tests:
