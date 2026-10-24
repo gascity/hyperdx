@@ -115,3 +115,72 @@ describe('proxy auth shared-secret rotation', () => {
     expect(String(error)).not.toContain(sharedSecret);
   });
 });
+
+// The bundled OpenTelemetry SDK's advanced network capture records every
+// incoming request header on the server span as the request arrives, before
+// consumeProxyAuthSecret runs, and exports it. Proxy auth must not start with
+// it on. The accepted spellings mirror the SDK's own boolean parsing.
+describe('proxy auth with advanced network capture', () => {
+  const ORIGINAL = {
+    PROXY_AUTH_ENABLED: process.env.PROXY_AUTH_ENABLED,
+    PROXY_AUTH_SHARED_SECRET: process.env.PROXY_AUTH_SHARED_SECRET,
+    PROXY_AUTH_SHARED_SECRET_PREVIOUS:
+      process.env.PROXY_AUTH_SHARED_SECRET_PREVIOUS,
+    HDX_NODE_ADVANCED_NETWORK_CAPTURE:
+      process.env.HDX_NODE_ADVANCED_NETWORK_CAPTURE,
+  };
+  const SECRET = 'capture-guard-secret-must-not-leak';
+
+  function loadWithCapture(enabled: string, capture: string | undefined) {
+    process.env.PROXY_AUTH_ENABLED = enabled;
+    process.env.PROXY_AUTH_SHARED_SECRET = SECRET;
+    delete process.env.PROXY_AUTH_SHARED_SECRET_PREVIOUS;
+    if (capture === undefined) {
+      delete process.env.HDX_NODE_ADVANCED_NETWORK_CAPTURE;
+    } else {
+      process.env.HDX_NODE_ADVANCED_NETWORK_CAPTURE = capture;
+    }
+    jest.isolateModules(() => {
+      // eslint-disable-next-line @typescript-eslint/no-require-imports, n/no-missing-require
+      require('@/config');
+    });
+  }
+
+  afterEach(() => {
+    for (const [name, value] of Object.entries(ORIGINAL)) {
+      if (value === undefined) {
+        delete process.env[name];
+      } else {
+        process.env[name] = value;
+      }
+    }
+    jest.resetModules();
+  });
+
+  it.each(['true', '1', 'YES', ' True '])(
+    'refuses to start when capture is %p, without leaking the secret',
+    capture => {
+      let error: unknown;
+      try {
+        loadWithCapture('true', capture);
+      } catch (caught) {
+        error = caught;
+      }
+
+      expect(error).toBeInstanceOf(Error);
+      expect(String(error)).toContain('HDX_NODE_ADVANCED_NETWORK_CAPTURE');
+      expect(String(error)).not.toContain(SECRET);
+    },
+  );
+
+  it.each([undefined, '', 'false', '0', 'no'])(
+    'starts when capture is %p',
+    capture => {
+      expect(() => loadWithCapture('true', capture)).not.toThrow();
+    },
+  );
+
+  it('leaves the capture check inert when proxy auth is disabled', () => {
+    expect(() => loadWithCapture('false', 'true')).not.toThrow();
+  });
+});

@@ -120,6 +120,22 @@ if (
       'PROXY_AUTH_SHARED_SECRET when proxy auth is enabled.',
   );
 }
+// The bundled OpenTelemetry SDK's advanced network capture records every
+// incoming request header on the server span as the request arrives, before
+// consumeProxyAuthSecret can take the shared secret off it, and exports it
+// along with the session and gate cookies. Same truthy spellings as the SDK.
+if (
+  IS_PROXY_AUTH_ENABLED &&
+  ['true', 'yes', '1'].includes(
+    (env.HDX_NODE_ADVANCED_NETWORK_CAPTURE ?? '').toLowerCase().trim(),
+  )
+) {
+  throw new Error(
+    'PROXY_AUTH_ENABLED=true is incompatible with ' +
+      'HDX_NODE_ADVANCED_NETWORK_CAPTURE: it exports request headers, ' +
+      'including the proxy-auth secret, before the app can remove them.',
+  );
+}
 
 // Only used to bootstrap empty instances
 export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;
