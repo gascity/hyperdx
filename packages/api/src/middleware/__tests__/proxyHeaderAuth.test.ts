@@ -9,6 +9,7 @@ import type { Request, Response } from 'express';
 import * as config from '@/config';
 import { findUserByEmail } from '@/controllers/user';
 import {
+  consumeProxyAuthSecret,
   getProxyAuthEmail,
   proxyHeaderAuth,
 } from '@/middleware/proxyHeaderAuth';
@@ -252,6 +253,71 @@ describe('getProxyAuthEmail', () => {
         ),
       ).toBeNull();
     });
+  });
+});
+
+describe('consumeProxyAuthSecret', () => {
+  // A request shaped like Node's IncomingMessage + Express's req.get(): the
+  // lowercased headers map, the raw name/value list, and a getter over headers.
+  function rawReq(pairs: [string, string][]): Request {
+    const headers: Record<string, string> = {};
+    const rawHeaders: string[] = [];
+    for (const [k, v] of pairs) {
+      headers[k.toLowerCase()] = v;
+      rawHeaders.push(k, v);
+    }
+    return {
+      headers,
+      rawHeaders,
+      get: (name: string): string | undefined => headers[name.toLowerCase()],
+    } as unknown as Request;
+  }
+
+  beforeEach(() => {
+    cfg.PROXY_AUTH_SHARED_SECRET = CURRENT_SECRET;
+  });
+
+  it('takes the secret off headers and rawHeaders but keeps the rest', () => {
+    const req = rawReq([
+      ['X-Auth-Request-Email', 'a@gascity.com'],
+      ['X-Hdx-Proxy-Auth-Secret', CURRENT_SECRET],
+      ['Cookie', 'connect.sid=abc'],
+    ]);
+    const next = jest.fn();
+    consumeProxyAuthSecret(req, {} as Response, next);
+    expect(next).toHaveBeenCalledWith();
+    expect(req.headers['x-hdx-proxy-auth-secret']).toBeUndefined();
+    expect(req.rawHeaders).not.toContain(CURRENT_SECRET);
+    expect(req.headers['x-auth-request-email']).toBe('a@gascity.com');
+    expect(req.headers.cookie).toBe('connect.sid=abc');
+  });
+
+  it('still authenticates with the consumed secret', () => {
+    const req = rawReq([
+      ['x-auth-request-email', 'a@gascity.com'],
+      ['x-hdx-proxy-auth-secret', CURRENT_SECRET],
+    ]);
+    consumeProxyAuthSecret(req, {} as Response, jest.fn());
+    expect(getProxyAuthEmail(req)).toBe('a@gascity.com');
+  });
+
+  it('still rejects a wrong consumed secret', () => {
+    const req = rawReq([
+      ['x-auth-request-email', 'a@gascity.com'],
+      ['x-hdx-proxy-auth-secret', 'wrong-s3cret-value!!'],
+    ]);
+    consumeProxyAuthSecret(req, {} as Response, jest.fn());
+    expect(req.headers['x-hdx-proxy-auth-secret']).toBeUndefined();
+    expect(getProxyAuthEmail(req)).toBeNull();
+  });
+
+  it('is a no-op without the secret header', () => {
+    const req = rawReq([['x-auth-request-email', 'a@gascity.com']]);
+    const next = jest.fn();
+    consumeProxyAuthSecret(req, {} as Response, next);
+    expect(next).toHaveBeenCalledWith();
+    expect(req.rawHeaders).toEqual(['x-auth-request-email', 'a@gascity.com']);
+    expect(getProxyAuthEmail(req)).toBeNull();
   });
 });
 

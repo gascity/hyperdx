@@ -39,8 +39,40 @@ function hasControlChar(s: string): boolean {
   return false;
 }
 
+// The shared secret is injected by the gate on EVERY request, and two stock
+// HyperDX paths copy req.headers verbatim: the pino-http request log (written to
+// stdout and shipped to the log store) and the ClickHouse proxy (forwarded to
+// the connection's host, which any HyperDX user can point anywhere). So the
+// secret is taken off the request before any of that runs: consumeProxyAuthSecret
+// is mounted first in api-app.ts and parks the presented value here.
+const presentedSecrets = new WeakMap<Request, string>();
+
+export function consumeProxyAuthSecret(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void {
+  const name = config.PROXY_AUTH_SECRET_HEADER;
+  const value = req.get(name);
+  if (value !== undefined) {
+    presentedSecrets.set(req, value);
+    Reflect.deleteProperty(req.headers, name);
+    const scrubbed = req.rawHeaders.map((v, i, raw) =>
+      i % 2 === 1 && raw.at(i - 1)?.toLowerCase() === name ? '[REDACTED]' : v,
+    );
+    req.rawHeaders.splice(0, req.rawHeaders.length, ...scrubbed);
+  }
+  next();
+}
+
+function presentedSecret(req: Request): string {
+  return (
+    presentedSecrets.get(req) ?? req.get(config.PROXY_AUTH_SECRET_HEADER) ?? ''
+  );
+}
+
 function sharedSecretOk(req: Request): boolean {
-  const got = req.get(config.PROXY_AUTH_SECRET_HEADER) ?? '';
+  const got = presentedSecret(req);
   const currentMatches = secretEqual(got, config.PROXY_AUTH_SHARED_SECRET);
   const previousMatches = secretEqual(
     got,

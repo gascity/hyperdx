@@ -9,6 +9,7 @@ import mcpRouter from './mcp/app';
 import { isUserAuthenticated } from './middleware/auth';
 import defaultCors from './middleware/cors';
 import { appErrorHandler } from './middleware/error';
+import { consumeProxyAuthSecret } from './middleware/proxyHeaderAuth';
 import routers from './routers/api';
 import clickhouseProxyRouter from './routers/api/clickhouseProxy';
 import connectionsRouter from './routers/api/connections';
@@ -56,6 +57,9 @@ if (!config.IS_CI && config.FRONTEND_URL) {
 }
 
 app.disable('x-powered-by');
+// gascity fork: take the proxy-auth shared secret off the request before any
+// middleware can log or forward it (see middleware/proxyHeaderAuth.ts).
+app.use(consumeProxyAuthSecret);
 app.use(compression());
 app.use(express.json({ limit: '32mb', verify: captureProxyBody }));
 app.use(express.text({ limit: '32mb', verify: captureProxyBody }));
