@@ -23,10 +23,25 @@ import Team from '@/models/team';
 import User, { type UserDocument } from '@/models/user';
 import logger from '@/utils/logger';
 
+// RFC 5321 path limit; also bounds the work done on a header value.
+const MAX_EMAIL_LENGTH = 254;
+const WHITESPACE_OR_COMMA_RE = /[\s,]/;
+
 // Rejects obviously malformed values (a comma => a multi-valued header) before a
 // DB lookup. This is hygiene, NOT the security control -- the gate asserts the
-// authoritative, already-authenticated address.
-const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
+// authoritative, already-authenticated address. Accepts exactly one '@', a
+// non-empty local part, and a domain of two or more non-empty dot-separated
+// labels, with no whitespace or comma anywhere. Checked structurally rather
+// than with one backtracking regex, so a crafted header value costs linear time.
+function isWellFormedEmail(s: string): boolean {
+  if (s.length > MAX_EMAIL_LENGTH || WHITESPACE_OR_COMMA_RE.test(s)) {
+    return false;
+  }
+  const at = s.indexOf('@');
+  if (at <= 0 || s.includes('@', at + 1)) return false;
+  const labels = s.slice(at + 1).split('.');
+  return labels.length >= 2 && labels.every(label => label.length > 0);
+}
 
 // Control chars (\x00-\x1f, \x7f) aren't all matched by \s, and a ghost user
 // differing from a real one only by an invisible byte is a real vector. Checked
@@ -101,7 +116,7 @@ export function getProxyAuthEmail(req: Request): string | null {
   const raw = req.get(config.PROXY_AUTH_HEADER);
   if (!raw) return null;
   const email = raw.trim().toLowerCase();
-  if (!email || hasControlChar(email) || !EMAIL_RE.test(email)) return null;
+  if (!email || hasControlChar(email) || !isWellFormedEmail(email)) return null;
   return email;
 }
 

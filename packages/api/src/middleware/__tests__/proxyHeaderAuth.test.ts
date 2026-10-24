@@ -137,6 +137,60 @@ describe('getProxyAuthEmail', () => {
     }
   });
 
+  it('rejects empty domain labels', () => {
+    for (const v of ['a@gascity..com', 'a@.gascity.com', 'a@gascity.com.']) {
+      expect(
+        getProxyAuthEmail(
+          reqWith({
+            'x-auth-request-email': v,
+            'x-hdx-proxy-auth-secret': CURRENT_SECRET,
+          }),
+        ),
+      ).toBeNull();
+    }
+  });
+
+  it('accepts a multi-label domain', () => {
+    expect(
+      getProxyAuthEmail(
+        reqWith({
+          'x-auth-request-email': 'a.b@eng.gascity.com',
+          'x-hdx-proxy-auth-secret': CURRENT_SECRET,
+        }),
+      ),
+    ).toBe('a.b@eng.gascity.com');
+  });
+
+  it('rejects addresses longer than the RFC 5321 limit of 254', () => {
+    const tooLong = `${'a'.repeat(64)}@${'b'.repeat(180)}.gascity.com`;
+    expect(tooLong.length).toBeGreaterThan(254);
+    expect(
+      getProxyAuthEmail(
+        reqWith({
+          'x-auth-request-email': tooLong,
+          'x-hdx-proxy-auth-secret': CURRENT_SECRET,
+        }),
+      ),
+    ).toBeNull();
+  });
+
+  it('rejects a pathological dotted domain in linear time', () => {
+    // A domain of many dots that fails at the end is quadratic for an ambiguous
+    // pattern (a label class that also matches '.'): about 5 s for this input
+    // with the previous single-regex check.
+    const hostile = `a@${'.'.repeat(50_000)}@`;
+    const started = Date.now();
+    expect(
+      getProxyAuthEmail(
+        reqWith({
+          'x-auth-request-email': hostile,
+          'x-hdx-proxy-auth-secret': CURRENT_SECRET,
+        }),
+      ),
+    ).toBeNull();
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('rejects control characters in the local part (not just whitespace)', () => {
     // U+0001 is a control char NOT matched by \s, so it would slip past a naive
     // [^\s@] class -- the L-1 fix excludes \x00-\x1f explicitly.
