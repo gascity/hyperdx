@@ -38,23 +38,25 @@ jobs:
         run: yarn workspace @hyperdx/api exec tsc --noEmit
       - name: Focused auth unit tests
         # Anchored regex passed positionally (= testPathPattern) runs only the
-        # DB-free proxy-auth and config suites.
+        # DB-free proxy-auth suites plus upstream's config suite.
         run: >-
           DOTENV_CONFIG_PATH=.env.test yarn workspace @hyperdx/api exec jest
           --runInBand --ci --forceExit
-          '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
+          '(proxyHeaderAuth|proxyAuth[A-Za-z]+|__tests__/config)\.test\.ts$'
       - name: Build API production artifacts
         run: yarn workspace @hyperdx/api run build
       - name: Exact production-symbol guard
         run: |
           set -euo pipefail
           for spec in \
-            packages/api/build/src/config.js:IS_PROXY_AUTH_ENABLED \
-            packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET \
-            packages/api/build/src/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
-            packages/api/build/src/middleware/proxyHeaderAuth.js:timingSafeEqual \
-            packages/api/build/src/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
-            packages/api/build/src/middleware/auth.js:proxyHeaderAuth
+            packages/api/build/config.js:IS_PROXY_AUTH_ENABLED \
+            packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET \
+            packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+            packages/api/build/middleware/proxyHeaderAuth.js:timingSafeEqual \
+            packages/api/build/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+            packages/api/build/middleware/proxyHeaderAuth.js:consumeProxyAuthSecret \
+            packages/api/build/middleware/auth.js:establishProxyAuthSession \
+            packages/api/build/api-app.js:consumeProxyAuthSecret
           do
             file="${spec%%:*}"
             symbol="${spec#*:}"
