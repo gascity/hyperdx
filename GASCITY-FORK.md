@@ -80,7 +80,8 @@ redirect in `routers/api/root.ts`, and the credential strip in
 
 **CI guard (required):** the build asserts the patch symbols are present in the
 exact compiled files of the produced image (`config.js`, `middleware/auth.js`,
-`middleware/proxyHeaderAuth.js`, `api-app.js` under `/app/packages/api/build`).
+`middleware/proxyHeaderAuth.js`, `api-app.js`, `routers/api/clickhouseProxy.js`
+under `/app/packages/api/build`).
 The one silent failure mode is forgetting to repin the GitOps digest after a
 rebase and shipping stock upstream, which quietly re-introduces the second login.
 
@@ -102,7 +103,8 @@ Files (kept minimal to ease rebasing):
 - **`packages/api/src/api-app.ts`** *(one middleware)* — `consumeProxyAuthSecret`
   runs before every other middleware, so the secret is never in `req.headers`
   when the request logger or the ClickHouse proxy copy them.
-- **`packages/api/src/config.ts`** *(additive)* — the `PROXY_AUTH_*` env config.
+- **`packages/api/src/config.ts`** *(additive)* — the `PROXY_AUTH_*` env config
+  and the fail-closed startup checks.
 - **`packages/api/src/routers/api/clickhouseProxy.ts`** *(two lines,
   upstreamable)* — never forward the browser's `cookie` / `authorization` to the
   connection host, which any user can point at an arbitrary URL.
@@ -167,7 +169,14 @@ safe. Deployments MUST:
    telemetry must go to a collector you control: with `HYPERDX_API_KEY` set and
    no `OTEL_EXPORTER_OTLP_ENDPOINT`, the bundled OpenTelemetry SDK exports the
    API's logs, traces and metrics to HyperDX's hosted endpoint by default.
-5. **Scope `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS`** so the gate can't provision
+   The SDK's `HDX_NODE_ADVANCED_NETWORK_CAPTURE` records every request header
+   on the server span before the app sees the request, so the API refuses to
+   start with it and proxy auth both on.
+5. **Keep the gate's session cookie `SameSite=Lax` (or `Strict`).** In proxy
+   mode the gate's cookie is the credential that counts (HyperDX's own `Lax`
+   session cookie is never honored alone), so without `SameSite` a cross-site
+   form POST would reach the API as the signed-in user.
+6. **Scope `PROXY_AUTH_ALLOWED_EMAIL_DOMAINS`** so the gate can't provision
    arbitrary identities, **and** bind the Authentik *application* to the right
    group/policy — that binding is the **primary admission control** (who is
    allowed in at all). The domain allowlist is only a coarse backstop.
@@ -184,6 +193,15 @@ safe. Deployments MUST:
   with identical permissions. *Who* is allowed in is an Authentik decision, not
   HyperDX. First-time provisioning is logged as a distinct `user_provision` event
   for audit.
+- **The email is the identity.** A gate-asserted address maps to the HyperDX
+  user with that (lowercased) email, so anyone the IdP will assert an address
+  for becomes that user. Users must not be able to change their own email at
+  the IdP.
+- **Connection hosts are user-editable.** Any user can point a connection at
+  any host the API can reach, and the ClickHouse proxy sends that user's
+  requests there and returns the responses; the patch only stops it from
+  forwarding the browser's credentials and the shared secret. Restrict the
+  API's egress to the ClickHouse endpoints you actually use.
 - **Logout** clears the HyperDX session and bounces to `PROXY_AUTH_LOGOUT_URL`
   (the gate sign-out); a true IdP logout needs that URL to chain to Authentik's
   end-session endpoint.
@@ -195,7 +213,13 @@ an image against FerretDB with fake secrets and checks, through the app port and
 the API port: no headers / identity without secret / wrong secret (same and
 different length) / empty secret all 401; a bare session cookie 401s; a
 gate-vouched request gets a session as that user; another identity replaces the
-session; a foreign email domain 403s; logout bounces to the gate; and the secret
-never appears in container stdout, the OTLP export, or the request the
-ClickHouse proxy sends to the connection host. It also covers fail-closed
-startup and the current/previous rotation window.
+session under a new session id; a foreign email domain 403s; malformed,
+trailing-dot and plus-addressed identities are never linked to another user;
+logout bounces to the gate; and neither the secret nor the session cookie, the
+gate cookie or a bearer token appears in container stdout (error paths
+included), the OTLP export, or the request the ClickHouse proxy sends to the
+connection host. Run `auth` once more against a container started with
+`SMOKE_LOG_LEVEL=trace` (and `-e OTEL_LOG_LEVEL=debug`) for the most verbose
+logs. `telemetry` checks the production posture (`SMOKE_TELEMETRY=off`: no
+SDK, no `apiKey` from `/api/config`, nothing exported); `failclosed` and
+`rotation` cover fail-closed startup and the current/previous rotation window.
