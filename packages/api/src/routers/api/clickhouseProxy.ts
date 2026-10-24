@@ -246,6 +246,12 @@ const proxyMiddleware: RequestHandler =
         // set user-agent to the hyperdx version identifier
         proxyReq.setHeader('user-agent', `hyperdx ${CODE_VERSION}`);
 
+        // The target is a user-configured connection host: never hand it the
+        // browser's credentials (session and SSO-gate cookies, bearer tokens).
+        // ClickHouse authenticates via the X-ClickHouse-* headers set below.
+        proxyReq.removeHeader('cookie');
+        proxyReq.removeHeader('authorization');
+
         if (_req._hdx_connection?.username) {
           proxyReq.setHeader(
             'X-ClickHouse-User',
