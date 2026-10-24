@@ -62,11 +62,13 @@ jobs:
             packages/api/build/config.js:IS_PROXY_AUTH_ENABLED \
             packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET \
             packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+            packages/api/build/config.js:HDX_NODE_ADVANCED_NETWORK_CAPTURE \
             packages/api/build/middleware/proxyHeaderAuth.js:timingSafeEqual \
             packages/api/build/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
             packages/api/build/middleware/proxyHeaderAuth.js:consumeProxyAuthSecret \
             packages/api/build/middleware/auth.js:establishProxyAuthSession \
-            packages/api/build/api-app.js:consumeProxyAuthSecret
+            packages/api/build/api-app.js:consumeProxyAuthSecret \
+            packages/api/build/routers/api/clickhouseProxy.js:removeHeader
           do
             file="${spec%%:*}"
             symbol="${spec#*:}"
