@@ -28,6 +28,16 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
+      - name: Only fork-owned workflows on the build branch
+        # schedule / issue_comment / pull_request_target events read workflow
+        # files from the default branch (this one), so an inherited upstream
+        # workflow re-added by a rebase would run on the public fork.
+        run: |
+          extra=$(find .github/workflows -maxdepth 1 -type f ! -name 'gascity-*' | sort)
+          if [ -n "$extra" ]; then
+            echo "::error::inherited upstream workflows present; delete them in the rebase: $extra"
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 22
