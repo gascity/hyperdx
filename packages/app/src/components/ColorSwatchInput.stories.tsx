@@ -11,7 +11,7 @@ import {
 import { ColorSwatchInput } from './ColorSwatchInput';
 
 const meta = {
-  title: 'ColorSwatchInput',
+  title: 'Components/ColorSwatchInput',
   component: ColorSwatchInput,
 } satisfies Meta<typeof ColorSwatchInput>;
 
@@ -26,7 +26,7 @@ export const Default = () => {
 
 export const Selected = () => {
   const [value, setValue] = React.useState<ChartPaletteToken | undefined>(
-    'chart-1',
+    'chart-blue',
   );
   return <ColorSwatchInput value={value} onChange={setValue} />;
 };

@@ -3,13 +3,32 @@ import express from 'express';
 import { ObjectId } from 'mongodb';
 import { z } from 'zod';
 
+import {
+  EXTERNAL_API_SEARCH_DEFAULT_MAX_RESULTS,
+  EXTERNAL_API_SEARCH_MAX_RESULTS,
+} from '@/config';
 import { parseTimeRange } from '@/mcp/tools/query/helpers';
 import { getNonNullUserWithTeam } from '@/middleware/auth';
 import { processRequestWithEnhancedErrors as validateRequest } from '@/utils/enhancedErrors';
+import {
+  getCounter,
+  getHistogram,
+  recordDuration,
+} from '@/utils/instrumentation';
 import logger from '@/utils/logger';
 import { externalDashboardSearchRequestSchema } from '@/utils/zod';
 
 import { runSearchConfig, type SearchErrorCode } from './utils/search';
+
+const searchQueryDuration = getHistogram('hyperdx.search.query.duration_ms', {
+  description: 'Duration of external API v2 search queries against ClickHouse.',
+  unit: 'ms',
+});
+const searchQueryErrors = getCounter('hyperdx.search.query_errors', {
+  description:
+    'Count of external API v2 search query failures, labeled by error type ' +
+    '(semantic error codes like SOURCE_NOT_FOUND, or ClickHouse error types).',
+});
 
 // CH error types caused by user-supplied query content — map to 400.
 const CH_USER_INPUT_ERRORS = new Set([
@@ -208,10 +227,12 @@ const searchRequestSchema = z.object({
     .number()
     .int()
     .min(1)
-    .max(2000)
+    .max(EXTERNAL_API_SEARCH_MAX_RESULTS)
     .optional()
-    .default(100)
-    .describe('Maximum rows to return (1-2000). Default: 100.'),
+    .default(EXTERNAL_API_SEARCH_DEFAULT_MAX_RESULTS)
+    .describe(
+      `Maximum rows to return (1-${EXTERNAL_API_SEARCH_MAX_RESULTS}). Default: ${EXTERNAL_API_SEARCH_DEFAULT_MAX_RESULTS}.`,
+    ),
   offset: z
     .number()
     .int()
@@ -379,16 +400,19 @@ router.post(
         orderBy,
       });
 
-      const result = await runSearchConfig({
-        teamId: teamId.toString(),
-        config,
-        startDate,
-        endDate,
-        maxResults,
-        offset,
-      });
+      const result = await recordDuration(searchQueryDuration, () =>
+        runSearchConfig({
+          teamId: teamId.toString(),
+          config,
+          startDate,
+          endDate,
+          maxResults,
+          offset,
+        }),
+      );
 
       if (result.isError) {
+        searchQueryErrors.add(1, { error_type: result.code });
         return res
           .status(codeToStatus(result.code))
           .json({ message: result.message });
@@ -401,6 +425,7 @@ router.post(
           ?.type ?? 'UNKNOWN') as string;
         const safeMsg =
           (err.message.split('\n')[0] ?? '').slice(0, 300) || 'Query error';
+        searchQueryErrors.add(1, { error_type: chType });
         logger.error({ chType, safeMsg }, '[search] ClickHouse query error');
 
         if (CH_USER_INPUT_ERRORS.has(chType)) {

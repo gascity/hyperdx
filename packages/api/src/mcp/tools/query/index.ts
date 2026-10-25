@@ -1,20 +1,23 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
+import type { ToolDefinition, ToolRegistrar } from '@/mcp/tools/types';
 
-import type { McpContext, ToolDefinition } from '../types';
+import { registerEmergingSignals } from './emergingSignals';
 import { registerEventDeltas } from './eventDeltas';
 import { registerEventPatterns } from './eventPatterns';
 import { registerSearch } from './search';
+import { registerServiceHealth } from './serviceHealth';
 import { registerSql } from './sql';
 import { registerTable } from './table';
 import { registerTimeseries } from './timeseries';
 
-const queryTools: ToolDefinition = (server: McpServer, context: McpContext) => {
-  registerTimeseries(server, context);
-  registerTable(server, context);
-  registerSearch(server, context);
-  registerEventPatterns(server, context);
-  registerEventDeltas(server, context);
-  registerSql(server, context);
+const queryTools: ToolDefinition = (registrar: ToolRegistrar) => {
+  registerServiceHealth(registrar);
+  registerTimeseries(registrar);
+  registerTable(registrar);
+  registerSearch(registrar);
+  registerEventPatterns(registrar);
+  registerEventDeltas(registrar);
+  registerEmergingSignals(registrar);
+  registerSql(registrar);
 };
 
 export default queryTools;

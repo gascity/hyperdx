@@ -1,8 +1,9 @@
+import crypto from 'crypto';
+
 const env = process.env;
 
 // DEFAULTS
 const DEFAULT_APP_TYPE = 'api';
-const DEFAULT_EXPRESS_SESSION = 'hyperdx is cool 👋';
 const DEFAULT_FRONTEND_URL = env.HYPERDX_APP_PORT
   ? `http://localhost:${env.HYPERDX_APP_PORT}`
   : '';
@@ -13,8 +14,20 @@ export const APP_TYPE = (env.APP_TYPE || DEFAULT_APP_TYPE) as
   | 'api'
   | 'scheduled-task';
 export const CODE_VERSION = env.CODE_VERSION ?? '';
-export const EXPRESS_SESSION_SECRET = (env.EXPRESS_SESSION_SECRET ||
-  DEFAULT_EXPRESS_SESSION) as string;
+// Only for single container local deployments, disable authentication
+export const IS_LOCAL_APP_MODE =
+  env.IS_LOCAL_APP_MODE === 'DANGEROUSLY_is_local_app_mode💀';
+const LEGACY_PUBLIC_SESSION_SECRET = 'hyperdx is cool 👋';
+// Authenticated deployments never use the public demo secret. Without a safe
+// configured value, generate one per process (sessions end on restart).
+export const IS_EXPRESS_SESSION_SECRET_GENERATED =
+  !env.EXPRESS_SESSION_SECRET ||
+  (!IS_LOCAL_APP_MODE &&
+    env.EXPRESS_SESSION_SECRET === LEGACY_PUBLIC_SESSION_SECRET);
+export const EXPRESS_SESSION_SECRET =
+  !IS_EXPRESS_SESSION_SECRET_GENERATED && env.EXPRESS_SESSION_SECRET
+    ? env.EXPRESS_SESSION_SECRET
+    : crypto.randomBytes(32).toString('hex');
 export const FRONTEND_URL = (env.FRONTEND_URL ||
   DEFAULT_FRONTEND_URL) as string;
 const HYPERDX_IMAGE = env.HYPERDX_IMAGE;
@@ -28,6 +41,11 @@ export const IS_LOCAL_IMAGE = HYPERDX_IMAGE === 'all-in-one-noauth';
 export const IS_INLINE_API = env.HDX_PREVIEW_INLINE_API === 'true';
 export const FRONTEND_REDIRECT_BASE = IS_INLINE_API ? '' : FRONTEND_URL;
 export const INGESTION_API_KEY = env.INGESTION_API_KEY ?? '';
+// Opt-in: emit the contrib `datadogreceiver` on the collector so a
+// Datadog Agent can ship APM traces (DD trace API -> OTLP -> ClickHouse).
+// Off by default because the receiver has no per-team bearer-token auth like
+// `otlp/hyperdx`, so enabling it opens an unauthenticated ingest port (:8126).
+export const ENABLE_DATADOG_RECEIVER = env.ENABLE_DATADOG_RECEIVER === 'true';
 export const HYPERDX_API_KEY = env.HYPERDX_API_KEY as string;
 export const HYPERDX_LOG_LEVEL = env.HYPERDX_LOG_LEVEL as string;
 export const IS_CI = NODE_ENV === 'test';
@@ -38,12 +56,14 @@ export const OTEL_SERVICE_NAME = env.OTEL_SERVICE_NAME as string;
 export const PORT = Number.parseInt(env.PORT as string);
 export const OPAMP_PORT = Number.parseInt(env.OPAMP_PORT as string);
 export const USAGE_STATS_ENABLED = env.USAGE_STATS_ENABLED !== 'false';
+export const WEBHOOK_HOSTNAME_ALLOWLIST = env.WEBHOOK_HOSTNAME_ALLOWLIST ?? '';
 export const RUN_SCHEDULED_TASKS_EXTERNALLY =
   env.RUN_SCHEDULED_TASKS_EXTERNALLY === 'true';
 
-// Only for single container local deployments, disable authentication
-export const IS_LOCAL_APP_MODE =
-  env.IS_LOCAL_APP_MODE === 'DANGEROUSLY_is_local_app_mode💀';
+// 32-byte key (base64 or hex). Setting it is what turns on encryption of
+// stored third-party tokens; unset means they are stored in plain text. See
+// utils/tokenEncryption.ts.
+export const TOKEN_ENCRYPTION_KEY = env.TOKEN_ENCRYPTION_KEY;
 
 // gascity fork: reverse-proxy (forward-auth) SSO. See GASCITY-FORK.md.
 // Trust an identity header set by a trusted upstream gate (oauth2-proxy in front
@@ -53,7 +73,8 @@ export const IS_LOCAL_APP_MODE =
 // client-supplied PROXY_AUTH_HEADER / PROXY_AUTH_SECRET_HEADER on inbound and
 // re-set them only after a successful SSO, AND a NetworkPolicy MUST ensure only
 // the gate can reach this port. PROXY_AUTH_SHARED_SECRET is a strong in-app
-// backstop (a value the browser never sees); PROXY_AUTH_ALLOWED_EMAIL_DOMAINS is
+// backstop (values the browser never sees); one optional previous value permits
+// an attended rotation window. PROXY_AUTH_ALLOWED_EMAIL_DOMAINS is
 // defense-in-depth, NOT the primary control. With PROXY_AUTH_ENABLED unset, all
 // of this is inert and stock auth behavior is unchanged.
 export const IS_PROXY_AUTH_ENABLED = env.PROXY_AUTH_ENABLED === 'true';
@@ -67,6 +88,8 @@ export const PROXY_AUTH_ALLOWED_EMAIL_DOMAINS = (
   .map(d => d.trim().toLowerCase())
   .filter(Boolean);
 export const PROXY_AUTH_SHARED_SECRET = env.PROXY_AUTH_SHARED_SECRET || '';
+export const PROXY_AUTH_SHARED_SECRET_PREVIOUS =
+  env.PROXY_AUTH_SHARED_SECRET_PREVIOUS || '';
 export const PROXY_AUTH_SECRET_HEADER = (
   env.PROXY_AUTH_SECRET_HEADER || 'x-hdx-proxy-auth-secret'
 ).toLowerCase();
@@ -87,12 +110,54 @@ if (IS_PROXY_AUTH_ENABLED && !PROXY_AUTH_SHARED_SECRET) {
       'Refusing to start in header-only-trust mode.',
   );
 }
+if (
+  IS_PROXY_AUTH_ENABLED &&
+  PROXY_AUTH_SHARED_SECRET_PREVIOUS &&
+  PROXY_AUTH_SHARED_SECRET_PREVIOUS === PROXY_AUTH_SHARED_SECRET
+) {
+  throw new Error(
+    'PROXY_AUTH_SHARED_SECRET_PREVIOUS must differ from ' +
+      'PROXY_AUTH_SHARED_SECRET when proxy auth is enabled.',
+  );
+}
+// The bundled OpenTelemetry SDK's advanced network capture records every
+// incoming request header on the server span as the request arrives, before
+// consumeProxyAuthSecret can take the shared secret off it, and exports it
+// along with the session and gate cookies. Same truthy spellings as the SDK.
+if (
+  IS_PROXY_AUTH_ENABLED &&
+  ['true', 'yes', '1'].includes(
+    (env.HDX_NODE_ADVANCED_NETWORK_CAPTURE ?? '').toLowerCase().trim(),
+  )
+) {
+  throw new Error(
+    'PROXY_AUTH_ENABLED=true is incompatible with ' +
+      'HDX_NODE_ADVANCED_NETWORK_CAPTURE: it exports request headers, ' +
+      'including the proxy-auth secret, before the app can remove them.',
+  );
+}
 
 // Only used to bootstrap empty instances
 export const DEFAULT_CONNECTIONS = env.DEFAULT_CONNECTIONS;
 export const DEFAULT_SOURCES = env.DEFAULT_SOURCES;
 
 export const IS_PROMQL_ENABLED = env.ENABLE_PROMQL === 'true';
+
+export const EXTERNAL_API_RATE_LIMIT_MAX = (() => {
+  const parsed = Number(env.EXTERNAL_API_RATE_LIMIT_MAX);
+  return Number.isSafeInteger(parsed) && parsed > 0 ? parsed : 100;
+})();
+
+export const EXTERNAL_API_SEARCH_DEFAULT_MAX_RESULTS = 100;
+
+export const EXTERNAL_API_SEARCH_MAX_RESULTS = (() => {
+  const parsed = Number(env.EXTERNAL_API_SEARCH_MAX_RESULTS);
+  // A cap below the default would make requests without maxResults invalid.
+  return Number.isSafeInteger(parsed) &&
+    parsed >= EXTERNAL_API_SEARCH_DEFAULT_MAX_RESULTS
+    ? parsed
+    : 2000;
+})();
 
 // FOR CI ONLY
 export const CLICKHOUSE_HOST = env.CLICKHOUSE_HOST as string;

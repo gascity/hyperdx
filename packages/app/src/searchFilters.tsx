@@ -1,18 +1,60 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import produce from 'immer';
-import { parseKeyPath } from '@hyperdx/common-utils/dist/core/metadata';
 import {
-  coerceBooleanValue,
   type FilterState,
   filtersToQuery,
-  parseLuceneFilter,
+  parseQuery,
 } from '@hyperdx/common-utils/dist/filters';
 import type { Filter } from '@hyperdx/common-utils/dist/types';
 
+import {
+  cleanClickHouseExpression,
+  toQuotedClickHouseKeyExpression,
+} from './components/DBSearchPageFilters/utils';
 import { usePinnedFiltersApi, useUpdatePinnedFilters } from './pinnedFilters';
 import { useLocalStorage } from './utils';
 
 export const IS_ROOT_SPAN_COLUMN_NAME = 'isRootSpan';
+
+// Filter keys live in two forms.
+// 1. In-memory `FilterState`: use the clean/unquoted forms of each key. This is what
+// the UI renders, what test ids are built from, and what every key comparison expects.
+// 2. The persisted `Filter[]`: Uses the quoted/bracketed ClickHouse form so it emits
+// valid SQL verbatim. Persisted in URL params, local storage, and MongoDB for saved searches.
+
+// Convert the clean FilterState keys to valid SQL (quoted/bracket) keys.
+export const escapeFilterStateKeys = (
+  filters: FilterState,
+  knownColumns: Set<string>,
+): FilterState => {
+  const escaped: FilterState = {};
+  for (const [key, value] of Object.entries(filters)) {
+    escaped[toQuotedClickHouseKeyExpression(key, knownColumns)] = value;
+  }
+  return escaped;
+};
+
+// Convert valid SQL/persisted keys to clean FilterState keys.
+const unescapeFilterStateKeys = (filters: FilterState): FilterState => {
+  const cleaned: FilterState = {};
+  for (const [key, value] of Object.entries(filters)) {
+    cleaned[cleanClickHouseExpression(key)] = value;
+  }
+  return cleaned;
+};
+
+// Whether a clean FilterState key belongs to one of `allowedColumnNames`.
+// Top-level columns are stored as-is, nested JSON/Map keys as
+// `Root.nested.path`. An exact match handles the rare case of a column with
+// dots in its name.
+export const isKeyCompatibleWithColumns = (
+  key: string,
+  allowedColumnNames: Set<string>,
+): boolean => {
+  const dotIdx = key.indexOf('.');
+  const rootColumn = dotIdx > 0 ? key.slice(0, dotIdx) : key;
+  return allowedColumnNames.has(key) || allowedColumnNames.has(rootColumn);
+};
 
 export const areFiltersEqual = (a: FilterState, b: FilterState) => {
   const aKeys = Object.keys(a);
@@ -45,356 +87,45 @@ export const areFiltersEqual = (a: FilterState, b: FilterState) => {
   return true;
 };
 
-// Helper function to parse a string value as boolean if possible, or otherwise
-// return as string with surrounding quotes removed and SQL-escaped quotes unescaped.
-const getBooleanOrUnquotedString = (value: string): string | boolean => {
-  const trimmed = value.trim();
-
-  if (['true', 'false'].includes(trimmed.toLowerCase())) {
-    return trimmed.toLowerCase() === 'true';
-  }
-
-  // Remove surrounding quotes and reverse the escape sequences produced by
-  // filtersToQuery's escapeString. Order matters: collapse \\ → \ first so
-  // that the following '' → ' pass doesn't mistake content for an escape.
-  if (trimmed.startsWith("'") && trimmed.endsWith("'")) {
-    return trimmed.slice(1, -1).replace(/\\\\/g, '\\').replace(/''/g, "'");
-  }
-  return trimmed;
-};
-
-// Returns true when the single-quote at position `i` is a real string delimiter
-// rather than an escape sequence.  Handles both ClickHouse/SQL '' escaping and
-// backslash \' escaping.  An odd number of preceding backslashes means the
-// quote is escaped via \'; an even number (including zero) means the
-// backslashes are themselves escaped (\\) and the quote is a real boundary.
-function isQuoteBoundary(s: string, i: number): boolean {
-  if (s[i] !== "'") return false;
-  let backslashes = 0;
-  for (let j = i - 1; j >= 0 && s[j] === '\\'; j--) {
-    backslashes++;
-  }
-  return backslashes % 2 === 0;
-}
-
-// If we're inside a quoted string and hit a quote, check whether the next
-// character is also a quote ('' escape).  If so, skip both and stay in the
-// string.  Returns the new index to continue iteration from.
-function handleQuoteEscape(
-  s: string,
-  i: number,
-): { skip: boolean; next: number } {
-  if (i + 1 < s.length && s[i + 1] === "'") {
-    return { skip: true, next: i + 1 };
-  }
-  return { skip: false, next: i };
-}
-
-// Helper function to split on commas while respecting quoted strings and booleans.
-// Handles SQL-escaped single quotes ('') inside quoted strings.
-function splitValuesOnComma(valuesStr: string): (string | boolean)[] {
-  const values: (string | boolean)[] = [];
-  let currentValue = '';
-  let inString = false;
-
-  for (let i = 0; i < valuesStr.length; i++) {
-    const char = valuesStr[i];
-
-    if (isQuoteBoundary(valuesStr, i)) {
-      if (inString) {
-        const esc = handleQuoteEscape(valuesStr, i);
-        if (esc.skip) {
-          currentValue += "''";
-          i = esc.next;
-          continue;
-        }
-      }
-      inString = !inString;
-      currentValue += char;
-      continue;
-    }
-
-    if (!inString && char === ',') {
-      if (currentValue.trim()) {
-        values.push(getBooleanOrUnquotedString(currentValue));
-      }
-      currentValue = '';
-      continue;
-    }
-
-    currentValue += char;
-  }
-
-  // Add the last value
-  if (currentValue.trim()) {
-    values.push(getBooleanOrUnquotedString(currentValue));
-  }
-
-  return values;
-}
-
-// Check whether a SQL fragment contains a keyword or operator outside of
-// single-quoted strings.  Accepts either single characters (=, <, >) or
-// multi-character keywords (' OR ', ' BETWEEN ') to search for.
-function containsOutsideQuotes(
-  text: string,
-  targets: (string | { char: string })[],
-): boolean {
-  let inString = false;
-  for (let i = 0; i < text.length; i++) {
-    const char = text[i];
-    if (isQuoteBoundary(text, i)) {
-      if (inString) {
-        const esc = handleQuoteEscape(text, i);
-        if (esc.skip) {
-          i = esc.next;
-          continue;
-        }
-      }
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-
-    for (const target of targets) {
-      if (typeof target === 'object') {
-        if (char === target.char) return true;
-      } else {
-        if (text.slice(i, i + target.length).toUpperCase() === target)
-          return true;
-      }
-    }
-  }
-  return false;
-}
-
-function containsOperatorOutsideQuotes(part: string): boolean {
-  return containsOutsideQuotes(part, [
-    { char: '=' },
-    { char: '<' },
-    { char: '>' },
-    ' OR ',
-  ]);
-}
-
-// Split a string on the first occurrence of `delimiter` that is outside
-// single-quoted strings.  Returns [before, after] or null if not found.
-function splitOnFirstOutsideQuotes(
-  text: string,
-  delimiter: string,
-): [string, string] | null {
-  let inString = false;
-  const upper = delimiter.toUpperCase();
-  for (let i = 0; i < text.length; i++) {
-    if (isQuoteBoundary(text, i)) {
-      if (inString) {
-        const esc = handleQuoteEscape(text, i);
-        if (esc.skip) {
-          i = esc.next;
-          continue;
-        }
-      }
-      inString = !inString;
-      continue;
-    }
-    if (inString) continue;
-    if (text.slice(i, i + upper.length).toUpperCase() === upper) {
-      return [text.slice(0, i), text.slice(i + upper.length)];
-    }
-  }
-  return null;
-}
-
-// Helper function to extract simple IN/NOT IN clauses from a condition
-// This handles both simple conditions and compound conditions with AND
-function extractInClauses(condition: string): Array<{
-  key: string;
-  values: (string | boolean)[];
-  isExclude: boolean;
-}> {
-  const results: Array<{
-    key: string;
-    values: (string | boolean)[];
-    isExclude: boolean;
-  }> = [];
-
-  // Split on ' AND ' while respecting quoted strings (including SQL-escaped quotes)
-  const parts: string[] = [];
-  let currentPart = '';
-  let inString = false;
-
-  for (let i = 0; i < condition.length; i++) {
-    const char = condition[i];
-
-    if (isQuoteBoundary(condition, i)) {
-      if (inString) {
-        const esc = handleQuoteEscape(condition, i);
-        if (esc.skip) {
-          currentPart += "''";
-          i = esc.next;
-          continue;
-        }
-      }
-      inString = !inString;
-      currentPart += char;
-      continue;
-    }
-
-    if (!inString && condition.slice(i, i + 5).toUpperCase() === ' AND ') {
-      if (currentPart.trim()) {
-        parts.push(currentPart.trim());
-      }
-      currentPart = '';
-      i += 4; // Skip past ' AND '
-      continue;
-    }
-
-    currentPart += char;
-  }
-
-  if (currentPart.trim()) {
-    parts.push(currentPart.trim());
-  }
-
-  // Process each part to extract IN/NOT IN clauses
-  for (const part of parts) {
-    // Skip parts that contain OR (not supported) or comparison operators,
-    // but only when those operators appear outside of quoted strings.
-    if (containsOperatorOutsideQuotes(part)) {
-      continue;
-    }
-
-    const isExclude = containsOutsideQuotes(part, [' NOT IN ']);
-    const hasIn = isExclude || containsOutsideQuotes(part, [' IN ']);
-
-    if (hasIn) {
-      // Split on the first unquoted ' IN ' / ' NOT IN '
-      const splitResult = splitOnFirstOutsideQuotes(
-        part,
-        isExclude ? ' NOT IN ' : ' IN ',
-      );
-      if (!splitResult) continue;
-      const [key, values] = splitResult;
-
-      const keyStr = key.trim();
-      const trimmedValues = values.trim();
-      const withoutParens =
-        trimmedValues.startsWith('(') && trimmedValues.endsWith(')')
-          ? trimmedValues.slice(1, -1)
-          : trimmedValues;
-
-      const valuesArray = splitValuesOnComma(withoutParens);
-
-      results.push({
-        key: keyStr,
-        values: valuesArray,
-        isExclude,
-      });
-    }
-  }
-
-  return results;
-}
-
-export const parseQuery = (
-  q: Filter[],
-): {
-  filters: FilterState;
-  /** Filters that could not be parsed into FilterState (preserved for re-emission) */
-  passthroughFilters: Filter[];
-} => {
-  const state = new Map<
-    string,
-    {
-      included: Set<string | boolean>;
-      excluded: Set<string | boolean>;
-      range?: { min: number; max: number };
-    }
-  >();
-  const passthroughFilters: Filter[] = [];
-  for (const filter of q) {
-    if (filter.type === 'lucene') {
-      const parsedFields = parseLuceneFilter(filter.condition);
-      if (parsedFields === undefined) {
-        // Parse failure — preserve so it isn't silently lost
-        if (filter.condition.trim()) {
-          passthroughFilters.push(filter);
-        }
-      } else {
-        for (const { key, included, excluded, range } of parsedFields) {
-          if (!state.has(key)) {
-            state.set(key, { included: new Set(), excluded: new Set() });
-          }
-          const sets = state.get(key)!;
-          for (const v of included) sets.included.add(v);
-          for (const v of excluded) sets.excluded.add(v);
-          if (range) sets.range = range;
-        }
-      }
-      continue;
-    }
-
-    if (filter.type !== 'sql') continue;
-
-    // Check for BETWEEN condition (only when BETWEEN appears outside quotes)
-    if (containsOutsideQuotes(filter.condition, [' BETWEEN '])) {
-      const betweenMatch = filter.condition.match(
-        /^(.+?)\s+BETWEEN\s+(.+?)\s+AND\s+(.+?)$/i,
-      );
-      if (betweenMatch) {
-        const [, key, minVal, maxVal] = betweenMatch;
-        const keyStr = key.trim();
-        const min = parseFloat(minVal.trim());
-        const max = parseFloat(maxVal.trim());
-
-        if (!state.has(keyStr)) {
-          state.set(keyStr, {
-            included: new Set(),
-            excluded: new Set(),
-            range: { min, max },
-          });
-        } else {
-          const existing = state.get(keyStr)!;
-          existing.range = { min, max };
-        }
-        continue;
-      }
-    }
-
-    // Extract all simple IN/NOT IN clauses from the condition
-    // This handles both simple conditions and compound conditions with AND/OR
-    const inClauses = extractInClauses(filter.condition);
-
-    for (const clause of inClauses) {
-      if (!state.has(clause.key)) {
-        state.set(clause.key, { included: new Set(), excluded: new Set() });
-      }
-      const sets = state.get(clause.key)!;
-      clause.values.forEach(v => {
-        if (clause.isExclude) {
-          sets.excluded.add(v);
-        } else {
-          sets.included.add(v);
-        }
-      });
-    }
-  }
-  return { filters: Object.fromEntries(state), passthroughFilters };
-};
+// parseQuery (and its helpers) now live in common-utils as the inverse of
+// filtersToQuery; re-export so existing `@/searchFilters` importers keep working.
+export { parseQuery };
 
 export const useSearchPageFilterState = ({
   searchQuery = [],
   onFilterChange,
+  dateTimeColumns,
+  knownColumns,
 }: {
   searchQuery?: Filter[];
   onFilterChange: (filters: Filter[]) => void;
+  dateTimeColumns?: ReadonlyMap<string, string>;
+  /**
+   * Top-level column names on the table, used to quote
+   * column names that contain special characters
+   * (eg. service-name --> `service-name`).
+   **/
+  knownColumns: Set<string>;
 }) => {
+  // Access knownColumns through a ref so the returned mutators (which depend on
+  // updateFilterQuery) keep stable identities across knownColumns reference
+  // changes. The known columns are only used by the mutators, which are called
+  // on user input, not render, so avoid re-render by using a stable ref.
+  const knownColumnsRef = useRef<Set<string>>(knownColumns);
+  useEffect(() => {
+    knownColumnsRef.current = knownColumns;
+  }, [knownColumns]);
+
+  // Persisted filters carry canonical (escaped) keys; convert back to the clean
+  // keys the sidebar/comparisons use as they enter in-memory FilterState.
   const parsedQuery = useMemo(() => {
     try {
-      return parseQuery(searchQuery);
+      return {
+        filters: unescapeFilterStateKeys(parseQuery(searchQuery).filters),
+      };
     } catch (e) {
       console.error(e);
-      return { filters: {}, passthroughFilters: [] };
+      return { filters: {} };
     }
   }, [searchQuery]);
 
@@ -408,32 +139,17 @@ export const useSearchPageFilterState = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [parsedQuery.filters]);
 
-  // Migrate legacy SQL filters to Lucene on load so URLs become canonical
-  const hasMigratedRef = useRef(false);
-  useEffect(() => {
-    if (hasMigratedRef.current) return;
-    const hasSqlFilters = searchQuery?.some(
-      f => 'condition' in f && f.type === 'sql',
-    );
-    if (hasSqlFilters && Object.keys(parsedQuery.filters).length > 0) {
-      hasMigratedRef.current = true;
-      onFilterChange([
-        ...filtersToQuery(parsedQuery.filters),
-        ...parsedQuery.passthroughFilters,
-      ]);
-    }
-  }, [searchQuery, parsedQuery, onFilterChange]);
-
   const updateFilterQuery = useCallback(
     (newFilters: FilterState) => {
-      // Preserve unparseable filters so they aren't silently lost when
-      // the user toggles a sidebar facet.
-      onFilterChange([
-        ...filtersToQuery(newFilters),
-        ...parsedQuery.passthroughFilters,
-      ]);
+      // Escape filter keys here prior to saving so the URL / saved
+      // search holds valid-SQL keys while FilterState stays clean.
+      const escapedFilters = escapeFilterStateKeys(
+        newFilters,
+        knownColumnsRef.current,
+      );
+      onFilterChange(filtersToQuery(escapedFilters, { dateTimeColumns }));
     },
-    [onFilterChange, parsedQuery.passthroughFilters],
+    [onFilterChange, dateTimeColumns],
   );
 
   const setFilterValue = useCallback(
@@ -442,21 +158,15 @@ export const useSearchPageFilterState = ({
       value: string | boolean,
       action?: 'only' | 'exclude' | 'include',
     ) => {
-      // Normalize bracket notation to dot notation so the key matches
-      // what parseQuery returns after a Lucene round-trip.
-      const key = parseKeyPath(property).join('.');
-      // Normalize "true"/"false" strings to booleans so the value matches
-      // what parseLuceneFilter returns after a Lucene round-trip.
-      const normalizedValue = coerceBooleanValue(value);
       setFilters(prevFilters => {
         const newFilters = produce(prevFilters, draft => {
-          if (!draft[key]) {
-            draft[key] = { included: new Set(), excluded: new Set() };
+          if (!draft[property]) {
+            draft[property] = { included: new Set(), excluded: new Set() };
           }
 
           if (action === 'only') {
-            draft[key] = {
-              included: new Set([normalizedValue]),
+            draft[property] = {
+              included: new Set([value]),
               excluded: new Set(),
             };
             return;
@@ -464,22 +174,48 @@ export const useSearchPageFilterState = ({
 
           if (action === 'exclude') {
             // Remove from included if it was there
-            draft[key].included.delete(normalizedValue);
+            draft[property].included.delete(value);
             // Toggle in excluded
-            if (draft[key].excluded.has(normalizedValue)) {
-              draft[key].excluded.delete(normalizedValue);
+            if (draft[property].excluded.has(value)) {
+              draft[property].excluded.delete(value);
             } else {
-              draft[key].excluded.add(normalizedValue);
+              draft[property].excluded.add(value);
             }
             return;
           }
 
           // Regular toggle (include)
-          draft[key].excluded.delete(normalizedValue);
-          if (draft[key].included.has(normalizedValue)) {
-            draft[key].included.delete(normalizedValue);
+          draft[property].excluded.delete(value);
+          if (draft[property].included.has(value)) {
+            draft[property].included.delete(value);
           } else {
-            draft[key].included.add(normalizedValue);
+            draft[property].included.add(value);
+          }
+        });
+        updateFilterQuery(newFilters);
+        return newFilters;
+      });
+    },
+    [updateFilterQuery],
+  );
+
+  // Apply several "only" filters atomically: each listed property is set to
+  // exactly its given value in a single state update, emitting onFilterChange
+  // (and therefore a re-query) once rather than once per property. Use this
+  // instead of looping setFilterValue(..., 'only') when scoping to multiple
+  // columns at once (e.g. focusing a multi-group chart series).
+  const setOnlyFilters = useCallback(
+    (entries: { property: string; value: string | boolean }[]) => {
+      if (entries.length === 0) {
+        return;
+      }
+      setFilters(prevFilters => {
+        const newFilters = produce(prevFilters, draft => {
+          for (const { property, value } of entries) {
+            draft[property] = {
+              included: new Set([value]),
+              excluded: new Set(),
+            };
           }
         });
         updateFilterQuery(newFilters);
@@ -491,13 +227,12 @@ export const useSearchPageFilterState = ({
 
   const setFilterRange = useCallback(
     (property: string, range: { min: number; max: number }) => {
-      const key = parseKeyPath(property).join('.');
       setFilters(prevFilters => {
         const newFilters = produce(prevFilters, draft => {
-          if (!draft[key]) {
-            draft[key] = { included: new Set(), excluded: new Set() };
+          if (!draft[property]) {
+            draft[property] = { included: new Set(), excluded: new Set() };
           }
-          draft[key].range = range;
+          draft[property].range = range;
         });
         updateFilterQuery(newFilters);
         return newFilters;
@@ -508,10 +243,38 @@ export const useSearchPageFilterState = ({
 
   const clearFilter = useCallback(
     (property: string) => {
-      const key = parseKeyPath(property).join('.');
       setFilters(prevFilters => {
         const newFilters = produce(prevFilters, draft => {
-          delete draft[key];
+          delete draft[property];
+        });
+        updateFilterQuery(newFilters);
+        return newFilters;
+      });
+    },
+    [updateFilterQuery],
+  );
+
+  // Swap one value for another within the same set (included or excluded),
+  // preserving polarity, in a single state update. Two setFilterValue calls
+  // would emit onFilterChange twice (one query run each); this emits once.
+  const replaceFilterValue = useCallback(
+    (
+      property: string,
+      oldValue: string | boolean,
+      newValue: string | boolean,
+      action: 'include' | 'exclude',
+    ) => {
+      setFilters(prevFilters => {
+        const newFilters = produce(prevFilters, draft => {
+          if (!draft[property]) {
+            draft[property] = { included: new Set(), excluded: new Set() };
+          }
+          const set =
+            action === 'exclude'
+              ? draft[property].excluded
+              : draft[property].included;
+          set.delete(oldValue);
+          set.add(newValue);
         });
         updateFilterQuery(newFilters);
         return newFilters;
@@ -533,12 +296,7 @@ export const useSearchPageFilterState = ({
       const dropped: string[] = [];
       const kept: FilterState = {};
       for (const [key, value] of Object.entries(filters)) {
-        // Filter keys are dot-normalized — top-level columns are stored as-is,
-        // nested JSON/Map keys as `Root.nested.path`. An exact match handles
-        // the rare case of a column with dots in its name.
-        const dotIdx = key.indexOf('.');
-        const rootColumn = dotIdx > 0 ? key.slice(0, dotIdx) : key;
-        if (allowedColumnNames.has(key) || allowedColumnNames.has(rootColumn)) {
+        if (isKeyCompatibleWithColumns(key, allowedColumnNames)) {
           kept[key] = value;
         } else {
           dropped.push(key);
@@ -557,6 +315,8 @@ export const useSearchPageFilterState = ({
     filters,
     setFilters,
     setFilterValue,
+    setOnlyFilters,
+    replaceFilterValue,
     setFilterRange,
     clearFilter,
     clearAllFilters,
@@ -634,7 +394,7 @@ function toggleValueInFilters(
 
 /**
  * Hook for personal pinned filters stored in localStorage.
- * This is the original storage mechanism — per-user, per-browser.
+ * This is the original storage mechanism, per-user, per-browser.
  */
 function usePersonalPinnedFilters(sourceId: string | null) {
   const [_pinnedFilters, _setPinnedFilters] = useLocalStorage<{
@@ -695,7 +455,7 @@ export function usePinnedFilters(sourceId: string | null) {
   const updateTeamMutation = useUpdatePinnedFilters();
 
   // Optimistic state keyed by sourceId so it is automatically ignored when
-  // the source changes — no useEffect needed to clear stale state.
+  // the source changes, no useEffect needed to clear stale state.
   const [optimisticTeam, setOptimisticTeam] = useState<{
     sourceId: string;
     fields: string[];
@@ -723,7 +483,7 @@ export function usePinnedFilters(sourceId: string | null) {
     [effectiveTeam, personal.fields, personal.filters],
   );
 
-  // Debounce for team API writes — cancelled on unmount to prevent stale writes.
+  // Debounce for team API writes, cancelled on unmount to prevent stale writes.
   const pendingTeamUpdateRef = useRef<ReturnType<typeof setTimeout> | null>(
     null,
   );
@@ -786,7 +546,7 @@ export function usePinnedFilters(sourceId: string | null) {
     [personal],
   );
 
-  // Personal-only checks (not merged) — so team pins don't show as personal
+  // Personal-only checks (not merged), so team pins don't show as personal
   const isFilterPinned = useCallback(
     (property: string, value: string | boolean): boolean => {
       return (
@@ -817,7 +577,7 @@ export function usePinnedFilters(sourceId: string | null) {
       const fieldIndex = currentFields.indexOf(field);
 
       if (fieldIndex >= 0) {
-        // Removing field from shared — also clean up its filter values
+        // Removing field from shared, also clean up its filter values
         const newFields = currentFields.filter((_, i) => i !== fieldIndex);
         delete currentFilters[field];
         flushTeamUpdate(newFields, currentFilters);

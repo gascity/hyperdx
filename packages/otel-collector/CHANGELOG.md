@@ -1,5 +1,169 @@
 # @hyperdx/otel-collector
 
+## 2.42.0
+
+### Patch Changes
+
+- ab563d28: Stop the collector logging a `ParseJSON` syntax error for every log body that
+  contains braces but isn't JSON (e.g. Go struct or Python dict dumps). JSON
+  extraction now only matches objects that start with a quoted key, and remaining
+  parse failures in that statement group are silenced.
+- ca8e3fda: fix: support https for the PromQL remote-write endpoint and ClickHouse scraping
+
+  `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT` now accepts an `http://` or `https://` URL as well as a bare `host:port`. With `https://`, the collector's `prometheusremotewrite` exporter sends metrics over TLS and verifies the server certificate against the system CAs. Previously the exporter always used plain HTTP, so an HTTPS-only endpoint could not receive metrics. This applies to both standalone and OpAMP-managed collectors.
+
+  A bare `host:port` keeps plain HTTP, so existing setups are unchanged. The value must not include a path (`/write` is still appended automatically); the collector now exits at startup with a clear error if it does, or if the scheme is anything other than `http` or `https`.
+
+  The OpAMP-managed collector scraped the endpoint over plain HTTP regardless of its scheme. ClickHouse is now scraped in its own `clickhouse` job (previously the `otelcol` job) using the endpoint's scheme, with TLS verification on. The collector's own metrics endpoint stays on plain HTTP. A bare `host:port` or `http://` endpoint behaves as before. Scraped ClickHouse metrics now carry `job="clickhouse"` instead of `job="otelcol"`.
+
+## 2.41.0
+
+## 2.40.0
+
+### Minor Changes
+
+- 3ab758e4: feat(otel-collector): compile in statsdreceiver
+
+  Available for a user's own pipeline config (e.g. via
+  `CUSTOM_OTELCOL_CONFIG_FILE`) to ingest StatsD/DogStatsD metrics
+  directly, without a separate StatsD-to-OTLP bridge. Purely additive:
+  being compiled in changes no default pipeline or behavior on its own.
+
+## 2.39.1
+
+## 2.39.0
+
+### Minor Changes
+
+- 7651bc34: feat: add text indexes for seeding the trace schema
+- fc4d5878: feat(otel-collector): compile in spanmetricsconnector
+
+  Available for a user's own pipeline config (e.g. via
+  `CUSTOM_OTELCOL_CONFIG_FILE`) to compute call-count and duration
+  metrics from spans - most useful alongside the existing
+  `datadogreceiver` support for ingesting Datadog Agent traces, where
+  there was previously no way to derive RED metrics from that trace data
+  once ingested. Purely additive: being compiled in changes no default
+  pipeline or behavior on its own.
+
+## 2.38.0
+
+### Patch Changes
+
+- 808b3453: Accept `Bearer `-prefixed Authorization header values on the OTLP receiver in standalone mode (`OTLP_AUTH_TOKEN`). Previously only the bare-token form of the header was accepted, rejecting RFC 6750 clients that send `Authorization: Bearer <token>`. The `Bearer`, `bearer`, and `BEARER` prefixed forms are now accepted alongside the bare token.
+
+## 2.37.0
+
+## 2.36.0
+
+### Minor Changes
+
+- 395ae8d6: feat: support per-signal ClickHouse table TTLs and reconcile TTL on existing tables
+
+  Adds `HYPERDX_OTEL_EXPORTER_LOGS_TTL`, `HYPERDX_OTEL_EXPORTER_TRACES_TTL`, `HYPERDX_OTEL_EXPORTER_METRICS_TTL` and `HYPERDX_OTEL_EXPORTER_SESSIONS_TTL`, each falling back to the existing `HYPERDX_OTEL_EXPORTER_TABLES_TTL`, so retention can be configured independently per signal (e.g. keep logs and traces for 6 months while metrics stay at 30 days).
+
+  When `HYPERDX_OTEL_EXPORTER_RECONCILE_TABLE_TTL=true`, the migrate tool also applies the configured TTL to tables that already exist (`ALTER TABLE ... MODIFY TTL`), diff-guarded so only tables whose retention actually differs are changed. Previously a changed TTL only affected newly-created tables. Extending a retention uses `materialize_ttl_after_modify=1` so data already on disk is kept for the new (longer) period; shrinking uses `=0` so a startup reconcile never triggers a bulk delete (existing parts age out under their old TTL). Only a plain `<anchor> + <one fixed-length interval>` retention is rewritten: compound policies (`TO VOLUME`/`TO DISK` tiering, `RECOMPRESS`, `GROUP BY` rollups, several rules) and calendar-unit retentions (month/quarter/year) are reported and left untouched. Off by default. Implements hyperdxio/hyperdx#1311.
+
+### Patch Changes
+
+- d205a776: Allow the ClickHouse exporter request timeout to be configured with
+  `HYPERDX_OTEL_EXPORTER_TIMEOUT` in both OpAMP-managed and standalone collector
+  modes. The default remains 5 seconds.
+
+## 2.35.0
+
+### Minor Changes
+
+- 8351d632: Add OIDC-based bearer token authentication for the OTLP receiver in standalone mode, as an alternative to the existing static `OTLP_AUTH_TOKEN`. Set `OIDC_ISSUER_URL` and `OIDC_AUDIENCE` to validate incoming OTLP requests against an OIDC provider's published JWKS instead of a single long-lived shared secret.
+
+### Patch Changes
+
+- 58a467ae: Use the OpAMP supervisor's native `passthrough_logs` for collector log
+  forwarding instead of a background `tail` process. The old approach had
+  the supervisor and the tailer writing to the same stdout fd with no
+  synchronization, so log lines were getting mangled by the two streams
+  interleaving mid-line. The native approach has the supervisor re-emitting
+  the collector's output through its own logger to avoid this.
+
+## 2.34.0
+
+## 2.33.0
+
+## 2.32.0
+
+## 2.31.0
+
+## 2.30.1
+
+## 2.30.0
+
+### Minor Changes
+
+- 727d3274: Add an opt-in Datadog receiver (gated behind `ENABLE_DATADOG_RECEIVER`) so a
+  Datadog Agent can ship traces, metrics, and logs to HyperDX. The contrib
+  `datadogreceiver` is compiled into the collector binary and, when enabled, the
+  OpAMP controller attaches it (listening on `0.0.0.0:8126`) to the traces,
+  metrics, and logs pipelines. When collector authentication is enforced, the
+  receiver validates the `DD-API-KEY` header against team API keys.
+- 3f1e1fe4: feat: update metrics schema for more efficient PK and time pruning
+
+## 2.29.0
+
+### Minor Changes
+
+- 34a855969: chore(otel-collector): bump base collector to v0.154.0
+
+  Upgrade the custom OTel Collector base from contrib v0.149.0 (core 1.55.0) to
+  v0.154.0 (core 1.60.0). Updates `OTEL_COLLECTOR_VERSION` /
+  `OTEL_COLLECTOR_CORE_VERSION` in `.env`, both Dockerfile ARG defaults, and the
+  smoke-test compose fallbacks.
+
+  Compatibility: no config changes required. Reviewed contrib and core breaking
+  changes across v0.150–v0.154 against every component HyperDX uses. All affected
+  upstream changes are either backward-compatible deprecation aliases
+  (`prometheusremotewrite`, `resourcedetection`), explicit-config no-ops for
+  HyperDX (clickhouse exporter already sets `json:` directly; transform/routing
+  connectors set `error_mode: ignore` explicitly), or internal core feature-gate
+  stabilizations.
+
+- 6b6c340fc: chore(otel-collector): bump base collector to v0.155.0
+
+  Upgrade the custom OTel Collector base from contrib v0.154.0 (core 1.60.0) to
+  v0.155.0 (core 1.61.0). Updates `OTEL_COLLECTOR_VERSION` /
+  `OTEL_COLLECTOR_CORE_VERSION` in `.env`, both Dockerfile ARG defaults, and the
+  smoke-test compose fallbacks.
+
+  Compatibility: no config changes required. Reviewed contrib and core breaking
+  changes for v0.155.0 against every component HyperDX uses. The removed
+  `telemetry.UseLocalHostAsDefaultMetricsAddress` core gate has no impact because
+  the telemetry metrics endpoint is set explicitly (`host: 0.0.0.0`, `port:
+8888`), and the `memory_limiter` metric rename does not affect the smoke tests
+  (which assert on the startup log line and the `batch/lowlatency` metric label,
+  not memory_limiter metrics). All other breaking changes are in unused components
+  or internal feature-gate removals.
+
+### Patch Changes
+
+- 973d1201b: fix: polish promql experience across the app
+- a5dfce4b: fix(otel-collector): only enable the prometheus remote-write exporter in
+  standalone mode when `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT` is set
+
+  The standalone collector config used to unconditionally declare a
+  `prometheusremotewrite` exporter and a `metrics/promql` pipeline. When
+  `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT` was unset the exporter rendered
+  with an empty endpoint and every metrics batch failed to export.
+
+  The exporter and pipeline have been moved to
+  `docker/otel-collector/config.standalone.promql.yaml`, which is now only
+  loaded by `entrypoint.sh` when `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT` is
+  non-empty. This mirrors the OpAMP-managed gating in
+  `packages/api/src/opamp/controllers/opampController.ts` (which already
+  only adds the exporter when `IS_PROMQL_ENABLED` is true).
+
+  No action required if `CLICKHOUSE_PROMETHEUS_METRICS_ENDPOINT` is set; the
+  behavior is unchanged. If it was unset, the collector now stops emitting
+  the failing prometheus-remote-write attempts.
+
 ## 2.28.0
 
 ### Minor Changes

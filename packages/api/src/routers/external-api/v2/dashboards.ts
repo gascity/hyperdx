@@ -2,30 +2,23 @@ import express from 'express';
 import { uniq } from 'lodash';
 import { z } from 'zod';
 
-import { deleteDashboard } from '@/controllers/dashboard';
+import {
+  deleteDashboard,
+  recordDashboardOnboardingIfHasTiles,
+} from '@/controllers/dashboard';
 import Dashboard, { IDashboard } from '@/models/dashboard';
-import { validateRequestWithEnhancedErrors as validateRequest } from '@/utils/enhancedErrors';
+import { processRequestWithEnhancedErrors as validateRequest } from '@/utils/enhancedErrors';
 import { ExternalDashboardTileWithId, objectIdSchema } from '@/utils/zod';
 
 import {
   cleanupDashboardAlerts,
-  collectTileContainerRefIssues,
   convertExternalFiltersToInternal,
   convertExternalTilesToInternal,
   convertToExternalDashboard,
   createDashboardBodySchema,
-  fetchSourcesForValidation,
-  filterChangedHeatmapTiles,
-  getHeatmapTilesWithIncompatibleSources,
-  getInvalidOnClickSearchSources,
-  getMissingConnections,
-  getMissingOnClickDashboards,
-  getMissingSources,
-  isConfigTile,
-  isRawSqlExternalTileConfig,
   resolveSavedQueryLanguage,
-  SourceForValidation,
   updateDashboardBodySchema,
+  validateDashboardTiles,
 } from './utils/dashboards';
 
 /**
@@ -45,29 +38,6 @@ const EXTERNAL_DASHBOARD_PROJECTION = {
   containers: 1,
 } as const;
 
-function getSourceConnectionMismatches(
-  sources: SourceForValidation[],
-  tiles: ExternalDashboardTileWithId[],
-): string[] {
-  const sourceById = new Map(sources.map(s => [s._id.toString(), s]));
-
-  const sourcesWithInvalidConnections: string[] = [];
-  for (const tile of tiles) {
-    if (
-      isConfigTile(tile) &&
-      isRawSqlExternalTileConfig(tile.config) &&
-      tile.config.sourceId
-    ) {
-      const source = sourceById.get(tile.config.sourceId);
-      if (source && source.connection.toString() !== tile.config.connectionId) {
-        sourcesWithInvalidConnections.push(tile.config.sourceId);
-      }
-    }
-  }
-
-  return sourcesWithInvalidConnections;
-}
-
 /**
  * @openapi
  * components:
@@ -85,6 +55,14 @@ function getSourceConnectionMismatches(
  *       enum: [sql, lucene]
  *       description: Query language for the where clause.
  *     SavedFilterValue:
+ *       description: >
+ *         A single saved dashboard filter selection. Either a rendered SQL
+ *         condition, or a selection addressed by the name of the dashboard
+ *         variable it belongs to.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/SqlSavedFilterValue'
+ *         - $ref: '#/components/schemas/VariableSavedFilterValue'
+ *     SqlSavedFilterValue:
  *       type: object
  *       required: [condition]
  *       properties:
@@ -92,19 +70,45 @@ function getSourceConnectionMismatches(
  *           type: string
  *           enum: [sql]
  *           default: sql
- *           description: Filter type. Currently only "sql" is supported.
+ *           description: Filter type.
  *           example: "sql"
  *         condition:
  *           type: string
+ *           maxLength: 10000
  *           description: SQL filter condition. For example use expressions in the form "column IN ('value')".
  *           example: "ServiceName IN ('hdx-oss-dev-api')"
+ *     VariableSavedFilterValue:
+ *       type: object
+ *       required: [type, name, values]
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [variable]
+ *           description: Filter type.
+ *           example: "variable"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           maxLength: 1024
+ *           description: >
+ *             The variableName of the dashboard variable this selection
+ *             belongs to. Only allowed for variable-enabled filters.
+ *           example: "service"
+ *         values:
+ *           type: array
+ *           maxItems: 1000
+ *           description: Selected values
+ *           items:
+ *             type: string
+ *             maxLength: 10000
+ *           example: ["hdx-oss-dev-api"]
  *     MetricDataType:
  *       type: string
  *       enum: [sum, gauge, histogram, summary, exponential histogram]
  *       description: Metric data type, only for metrics data sources.
  *     TimeSeriesDisplayType:
  *       type: string
- *       enum: [stacked_bar, line]
+ *       enum: [stacked_bar, stacked_line, line]
  *       description: Visual representation type for the time series.
  *     QuantileLevel:
  *       type: number
@@ -154,6 +158,142 @@ function getSourceConnectionMismatches(
  *           type: string
  *           description: Custom unit label.
  *           example: "ms"
+ *
+ *     ChartPaletteToken:
+ *       type: string
+ *       enum: [chart-blue, chart-orange, chart-red, chart-cyan, chart-green, chart-pink, chart-purple, chart-light-blue, chart-brown, chart-gray, chart-success, chart-warning, chart-error]
+ *       description: >
+ *         Palette token used to color a number tile. Tokens reflow across
+ *         light and dark themes, so raw hex values are not accepted.
+ *       example: "chart-red"
+ *     BackgroundChart:
+ *       type: object
+ *       required:
+ *         - type
+ *       description: >
+ *         Optional background trend sparkline drawn behind a number tile's
+ *         value, derived from a time-bucketed version of the tile's query.
+ *         Builder number tiles only (raw SQL number tiles have no time
+ *         dimension to bucket).
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [line, area]
+ *           description: Sparkline shape.
+ *           example: "line"
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: >
+ *             Optional palette-token override for the sparkline. When unset
+ *             the sparkline inherits the tile's static color.
+ *     NumericColorCondition:
+ *       type: object
+ *       required:
+ *         - operator
+ *         - value
+ *         - color
+ *       description: Color rule comparing the displayed value against a single numeric bound.
+ *       properties:
+ *         operator:
+ *           type: string
+ *           enum: [gt, gte, lt, lte]
+ *           description: Numeric comparison operator.
+ *           example: "gt"
+ *         value:
+ *           type: number
+ *           description: >
+ *             Numeric bound the displayed value is compared against. Only
+ *             finite numbers are accepted (Infinity and NaN are rejected).
+ *           example: 100
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: Color applied when the rule matches.
+ *         label:
+ *           type: string
+ *           maxLength: 40
+ *           description: Optional label describing the rule.
+ *           example: "High"
+ *     BetweenColorCondition:
+ *       type: object
+ *       required:
+ *         - operator
+ *         - value
+ *         - color
+ *       description: Color rule matching when the displayed value falls within an inclusive range.
+ *       properties:
+ *         operator:
+ *           type: string
+ *           enum: [between]
+ *           description: Range comparison operator.
+ *           example: "between"
+ *         value:
+ *           type: array
+ *           minItems: 2
+ *           maxItems: 2
+ *           items:
+ *             type: number
+ *           description: >
+ *             Inclusive [min, max] range. Both bounds must be finite numbers.
+ *           example: [100, 500]
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: Color applied when the rule matches.
+ *         label:
+ *           type: string
+ *           maxLength: 40
+ *           description: Optional label describing the rule.
+ *           example: "Warning"
+ *     EqualityColorCondition:
+ *       type: object
+ *       required:
+ *         - operator
+ *         - value
+ *         - color
+ *       description: Color rule matching when the displayed value equals (eq) or does not equal (neq) a number or string.
+ *       properties:
+ *         operator:
+ *           type: string
+ *           enum: [eq, neq]
+ *           description: Equality comparison operator.
+ *           example: "eq"
+ *         value:
+ *           oneOf:
+ *             - type: number
+ *             - type: string
+ *               maxLength: 200
+ *           description: >
+ *             A finite number, or a string up to 200 characters, to compare
+ *             for equality.
+ *           example: "OK"
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: Color applied when the rule matches.
+ *         label:
+ *           type: string
+ *           maxLength: 40
+ *           description: Optional label describing the rule.
+ *           example: "Healthy"
+ *     NumberTileColorCondition:
+ *       description: >
+ *         A single conditional color rule for a number tile. Rules are
+ *         evaluated in order and the last matching rule wins. When no rule
+ *         matches, the static color applies, then the default text color.
+ *         The number-tile editor surfaces numeric and equality operators
+ *         only.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/NumericColorCondition'
+ *         - $ref: '#/components/schemas/BetweenColorCondition'
+ *         - $ref: '#/components/schemas/EqualityColorCondition'
+ *       discriminator:
+ *         propertyName: operator
+ *         mapping:
+ *           gt: '#/components/schemas/NumericColorCondition'
+ *           gte: '#/components/schemas/NumericColorCondition'
+ *           lt: '#/components/schemas/NumericColorCondition'
+ *           lte: '#/components/schemas/NumericColorCondition'
+ *           between: '#/components/schemas/BetweenColorCondition'
+ *           eq: '#/components/schemas/EqualityColorCondition'
+ *           neq: '#/components/schemas/EqualityColorCondition'
  *
  *     TimeChartSeries:
  *       type: object
@@ -469,6 +609,37 @@ function getSourceConnectionMismatches(
  *             Per-series number formatting options. When set, takes precedence
  *             over the chart-level numberFormat for this select item only.
  *
+ *     Formula:
+ *       type: object
+ *       required:
+ *         - expression
+ *       description: >
+ *         A derived series computed from the chart's select items via a
+ *         letter-ref arithmetic expression (metric, log, and trace sources
+ *         only). "A" refers
+ *         to select[0], "B" to select[1], and so on. The grammar supports
+ *         + - * /, parentheses, and numeric constants; expressions are parsed
+ *         and validated, never passed through as raw SQL. Division by zero or
+ *         a missing operand yields NULL (rendered as a gap).
+ *       properties:
+ *         expression:
+ *           type: string
+ *           maxLength: 1024
+ *           description: >
+ *             Arithmetic expression over the select items by position, e.g.
+ *             "A / (A + B) * 100" for a success-rate percentage.
+ *           example: "A / (A + B) * 100"
+ *         alias:
+ *           type: string
+ *           description: >
+ *             Display label for the formula series in chart legends and column
+ *             headers. Falls back to the raw expression text when unset.
+ *           example: "Success rate %"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: >
+ *             Per-series number formatting options for the formula series.
+ *
  *     LineBuilderChartConfig:
  *       type: object
  *       required:
@@ -512,6 +683,19 @@ function getSourceConnectionMismatches(
  *           type: boolean
  *           description: Fill missing time buckets with zero instead of leaving gaps.
  *           default: true
+ *         fitYAxisToData:
+ *           type: boolean
+ *           description: >
+ *             Set the y-axis lower bound to the minimum of the displayed data
+ *             instead of zero, making small fluctuations between series easier
+ *             to see.
+ *           default: false
+ *         lineInterpolation:
+ *           type: string
+ *           enum: [smooth, linear, step]
+ *           example: "step"
+ *           description: >
+ *             How points are connected. Defaults to "smooth" when omitted.
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
@@ -519,6 +703,29 @@ function getSourceConnectionMismatches(
  *           type: boolean
  *           description: Overlay the equivalent previous time period for comparison.
  *           default: false
+ *         seriesLimit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of series rendered (top-N by value). Omit to use
+ *             the default render cap, set 0 for unlimited, or a positive N to
+ *             keep the top N series.
+ *           example: 5
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived series computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             series are returned; the raw operand series are hidden.
+ *           default: true
  *
  *     BarBuilderChartConfig:
  *       type: object
@@ -566,6 +773,105 @@ function getSourceConnectionMismatches(
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *         seriesLimit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >-
+ *             Maximum number of series rendered (top-N by value). Omit to use
+ *             the default render cap, set 0 for unlimited, or a positive N to
+ *             keep the top N series.
+ *           example: 5
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived series computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             series are returned; the raw operand series are hidden.
+ *           default: true
+ *
+ *     StackedLineBuilderChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - sourceId
+ *         - select
+ *       description: Builder configuration for a stacked-line time-series chart.
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [stacked_line]
+ *           description: Display type discriminator. Must be "stacked_line" for stacked-line charts.
+ *           example: "stacked_line"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to query.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 20
+ *           description: >
+ *             One or more aggregated values to plot. When asRatio is true,
+ *             exactly two select items are required.
+ *           items:
+ *             $ref: '#/components/schemas/SelectItem'
+ *         groupBy:
+ *           type: string
+ *           description: Field expression to group results by (creates separate stacked bands per group value).
+ *           example: "service"
+ *           maxLength: 10000
+ *         asRatio:
+ *           type: boolean
+ *           description: Plot select[0] / select[1] as a ratio. Requires exactly two select items.
+ *           default: false
+ *         alignDateRangeToGranularity:
+ *           type: boolean
+ *           description: Align the date range boundaries to the query granularity interval.
+ *           default: true
+ *         fillNulls:
+ *           type: boolean
+ *           description: Fill missing time buckets with zero instead of leaving gaps.
+ *           default: true
+ *         lineInterpolation:
+ *           type: string
+ *           enum: [smooth, linear, step]
+ *           example: "step"
+ *           description: >
+ *             How points are connected. Defaults to "linear" when omitted.
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: Number formatting options for displayed values.
+ *         seriesLimit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >-
+ *             Maximum number of series rendered (top-N by value). Omit to use
+ *             the default render cap, set 0 for unlimited, or a positive N to
+ *             keep the top N series.
+ *           example: 5
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived series computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             series are returned; the raw operand series are hidden.
+ *           default: true
  *
  *     TableBuilderChartConfig:
  *       type: object
@@ -625,6 +931,21 @@ function getSourceConnectionMismatches(
  *         onClick:
  *           $ref: '#/components/schemas/OnClick'
  *           description: Optional link-out configuration applied when a user clicks a row.
+ *         formulas:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Derived columns computed from the select items via letter-ref
+ *             arithmetic ("A" = select[0], "B" = select[1], ...). Metric,
+ *             log, and trace sources only. Cannot be combined with asRatio.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
+ *         showOperandSeries:
+ *           type: boolean
+ *           description: >
+ *             Only meaningful with formulas. When false, only the formula
+ *             columns are returned; the raw operand columns are hidden.
+ *           default: true
  *
  *     NumberBuilderChartConfig:
  *       type: object
@@ -646,13 +967,44 @@ function getSourceConnectionMismatches(
  *         select:
  *           type: array
  *           minItems: 1
- *           maxItems: 1
- *           description: Exactly one aggregated value to display as a single number.
+ *           maxItems: 20
+ *           description: >
+ *             Exactly one aggregated value to display as a single number —
+ *             unless "formulas" is set, in which case the select items are
+ *             the formula's operands and the (single) formula value is
+ *             displayed instead.
  *           items:
  *             $ref: '#/components/schemas/SelectItem'
+ *         formulas:
+ *           type: array
+ *           maxItems: 1
+ *           description: >
+ *             A single derived value computed from the select items via
+ *             letter-ref arithmetic ("A" = select[0], "B" = select[1], ...).
+ *             Metric, log, and trace sources only. Number tiles display the
+ *             formula value and
+ *             always hide the operand series.
+ *           items:
+ *             $ref: '#/components/schemas/Formula'
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *         color:
+ *           $ref: '#/components/schemas/ChartPaletteToken'
+ *           description: Optional static color applied to the displayed number.
+ *         colorRules:
+ *           type: array
+ *           maxItems: 10
+ *           description: >
+ *             Ordered conditional color rules evaluated against the displayed
+ *             value (last match wins). Falls back to color, then the default
+ *             text color when no rule matches.
+ *           items:
+ *             $ref: '#/components/schemas/NumberTileColorCondition'
+ *         backgroundChart:
+ *           $ref: '#/components/schemas/BackgroundChart'
+ *           description: >
+ *             Optional background trend sparkline drawn behind the value.
  *
  *     PieBuilderChartConfig:
  *       type: object
@@ -683,9 +1035,79 @@ function getSourceConnectionMismatches(
  *           maxLength: 10000
  *           description: Field expression to group results by (one slice per group value).
  *           example: "service"
+ *         orderBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: >
+ *             Optional custom SQL ORDER BY expression (raw SQL). Overrides the
+ *             default value-descending ordering and, when combined with
+ *             "limit", controls which slices are kept.
+ *           example: "\"Count\" DESC"
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *         limit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of slices (SQL LIMIT). Without a custom "orderBy"
+ *             the query keeps the groups with the largest aggregated values;
+ *             with an "orderBy" it keeps the first slices in that order. Omit
+ *             or set 0 to fetch all groups.
+ *           example: 10
+ *
+ *     CategoricalBarBuilderChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - sourceId
+ *         - select
+ *       description: >
+ *         Builder configuration for a categorical bar chart tile. Each bar
+ *         represents one group value. Distinct from stacked_bar, which is a
+ *         time-series chart.
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [bar]
+ *           description: Display type discriminator. Must be "bar" for categorical bar charts.
+ *           example: "bar"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to query.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 1
+ *           description: Exactly one aggregated value used to size each bar.
+ *           items:
+ *             $ref: '#/components/schemas/SelectItem'
+ *         groupBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Field expression to group results by (one bar per group value).
+ *           example: "service"
+ *         orderBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: >
+ *             Optional custom SQL ORDER BY expression (raw SQL). Overrides the
+ *             default value-descending ordering and, when combined with
+ *             "limit", controls which bars are kept.
+ *           example: "\"Count\" DESC"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: Number formatting options for displayed values.
+ *         limit:
+ *           type: integer
+ *           minimum: 0
+ *           description: >
+ *             Maximum number of bars (SQL LIMIT). Without a custom "orderBy"
+ *             the query keeps the groups with the largest aggregated values;
+ *             with an "orderBy" it keeps the first bars in that order. Omit or
+ *             set 0 to fetch all groups.
+ *           example: 10
  *
  *     HeatmapSelectItem:
  *       type: object
@@ -721,15 +1143,15 @@ function getSourceConnectionMismatches(
  *           description: Scale type used to bucket values on the y-axis.
  *           example: "log"
  *
- *     HeatmapChartConfig:
+ *     HeatmapDistributionChartConfig:
  *       type: object
  *       required:
  *         - displayType
  *         - sourceId
  *         - select
  *       description: >
- *         Builder configuration for a heatmap tile. Heatmap is builder-only
- *         (no Raw SQL variant) and currently supports trace sources. The
+ *         Builder configuration for a distribution-mode heatmap tile, which
+ *         buckets a numeric value on the y-axis. Requires a trace source. The
  *         row-level filter lives at the chart-config level (where /
  *         whereLanguage), matching the HeatmapSeriesEditor in the UI.
  *       properties:
@@ -738,6 +1160,11 @@ function getSourceConnectionMismatches(
  *           enum: [heatmap]
  *           description: Display type discriminator. Must be "heatmap" for heatmap tiles.
  *           example: "heatmap"
+ *         heatmapMode:
+ *           type: string
+ *           enum: [distribution]
+ *           description: Heatmap mode. "distribution" is the default when omitted.
+ *           example: "distribution"
  *         sourceId:
  *           type: string
  *           description: ID of the data source to query.
@@ -762,6 +1189,64 @@ function getSourceConnectionMismatches(
  *         numberFormat:
  *           $ref: '#/components/schemas/NumberFormat'
  *           description: Number formatting options for displayed values.
+ *
+ *     HeatmapSeriesChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - heatmapMode
+ *         - sourceId
+ *         - select
+ *       description: >
+ *         Builder configuration for a series-mode heatmap tile, which shows
+ *         one aggregated series per groupBy value as a row on the y-axis.
+ *         Requires a trace, log, or metric source. Any filter lives
+ *         on the select item (where / whereLanguage).
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [heatmap]
+ *           description: Display type discriminator. Must be "heatmap" for heatmap tiles.
+ *           example: "heatmap"
+ *         heatmapMode:
+ *           type: string
+ *           enum: [series]
+ *           description: Heatmap mode. Must be "series" for series heatmaps.
+ *           example: "series"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to query.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 1
+ *           description: Exactly one aggregated value used to color each cell.
+ *           items:
+ *             $ref: '#/components/schemas/SelectItem'
+ *         groupBy:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Field expression to group results by (one row per group value).
+ *           example: "ServiceName"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: Number formatting options for displayed values.
+ *
+ *     HeatmapChartConfig:
+ *       description: >
+ *         Heatmap tile. There is no Raw SQL variant. For the builder variant,
+ *         omit heatmapMode (or set it to "distribution") for the distribution
+ *         heatmap, or set it to "series" for the series heatmap. Set
+ *         configType to "promql" for the PromQL variant.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/HeatmapDistributionChartConfig'
+ *         - $ref: '#/components/schemas/HeatmapSeriesChartConfig'
+ *         - $ref: '#/components/schemas/HeatmapPromqlChartConfig'
+ *       discriminator:
+ *         propertyName: configType
+ *         mapping:
+ *           promql: '#/components/schemas/HeatmapPromqlChartConfig'
  *
  *     SearchChartConfig:
  *       type: object
@@ -790,6 +1275,38 @@ function getSourceConnectionMismatches(
  *           type: string
  *           maxLength: 10000
  *           description: Filter condition for the search (syntax depends on whereLanguage).
+ *           default: ""
+ *           example: "level:error"
+ *         whereLanguage:
+ *           $ref: '#/components/schemas/QueryLanguage'
+ *           description: Query language for the where clause.
+ *
+ *     EventPatternsChartConfig:
+ *       type: object
+ *       required:
+ *         - displayType
+ *         - sourceId
+ *       description: Configuration for an event pattern mining tile. Clusters log or trace events by recurring message shapes.
+ *       properties:
+ *         displayType:
+ *           type: string
+ *           enum: [event_patterns]
+ *           description: Display type discriminator. Must be "event_patterns" for pattern mining tiles.
+ *           example: "event_patterns"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the data source to mine patterns from.
+ *           example: "65f5e4a3b9e77c001a111111"
+ *         select:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Column or expression to mine patterns from. Leave empty to use the source default (Body for logs, SpanName for traces).
+ *           default: ""
+ *           example: "Body"
+ *         where:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Filter condition for the pattern mining query (syntax depends on whereLanguage).
  *           default: ""
  *           example: "level:error"
  *         whereLanguage:
@@ -868,6 +1385,19 @@ function getSourceConnectionMismatches(
  *               type: boolean
  *               description: Expand date range boundaries to the query granularity interval.
  *               default: true
+ *             fitYAxisToData:
+ *               type: boolean
+ *               description: >
+ *                 Set the y-axis lower bound to the minimum of the displayed
+ *                 data instead of zero, making small fluctuations between
+ *                 series easier to see.
+ *               default: false
+ *             lineInterpolation:
+ *               type: string
+ *               enum: [smooth, linear, step]
+ *               example: "step"
+ *               description: >
+ *                 How points are connected. Defaults to "smooth" when omitted.
  *
  *     BarRawSqlChartConfig:
  *       description: Raw SQL configuration for a stacked-bar time-series chart.
@@ -890,6 +1420,34 @@ function getSourceConnectionMismatches(
  *               type: boolean
  *               description: Expand date range boundaries to the query granularity interval.
  *               default: true
+ *
+ *     StackedLineRawSqlChartConfig:
+ *       description: Raw SQL configuration for a stacked-line time-series chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/RawSqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [stacked_line]
+ *               description: Display as a stacked-line time-series chart.
+ *               example: "stacked_line"
+ *             fillNulls:
+ *               type: boolean
+ *               description: Fill missing time buckets with zero instead of leaving gaps.
+ *               default: true
+ *             alignDateRangeToGranularity:
+ *               type: boolean
+ *               description: Expand date range boundaries to the query granularity interval.
+ *               default: true
+ *             lineInterpolation:
+ *               type: string
+ *               enum: [smooth, linear, step]
+ *               example: "step"
+ *               description: >
+ *                 How points are connected. Defaults to "linear" when omitted.
  *
  *     TableRawSqlChartConfig:
  *       description: Raw SQL configuration for a table chart.
@@ -921,6 +1479,18 @@ function getSourceConnectionMismatches(
  *               enum: [number]
  *               description: Display as a single big-number chart.
  *               example: "number"
+ *             color:
+ *               $ref: '#/components/schemas/ChartPaletteToken'
+ *               description: Optional static color applied to the displayed number.
+ *             colorRules:
+ *               type: array
+ *               maxItems: 10
+ *               description: >
+ *                 Ordered conditional color rules evaluated against the displayed
+ *                 value (last match wins). Falls back to color, then the default
+ *                 text color when no rule matches.
+ *               items:
+ *                 $ref: '#/components/schemas/NumberTileColorCondition'
  *
  *     PieRawSqlChartConfig:
  *       description: Raw SQL configuration for a pie chart.
@@ -936,31 +1506,439 @@ function getSourceConnectionMismatches(
  *               description: Display as a pie chart.
  *               example: "pie"
  *
+ *     CategoricalBarRawSqlChartConfig:
+ *       description: Raw SQL configuration for a categorical bar chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/RawSqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [bar]
+ *               description: Display as a categorical bar chart.
+ *               example: "bar"
+ *
+ *     PromqlRangeExpression:
+ *       type: object
+ *       required:
+ *         - expression
+ *       description: A PromQL expression evaluated over the dashboard time range.
+ *       properties:
+ *         expression:
+ *           type: string
+ *           maxLength: 10000
+ *           description: >
+ *             PromQL expression. Supports dashboard variables and the
+ *             $__interval, $__rate_interval, and $__range macros.
+ *           example: "sum by (job) (rate(http_requests_total[$__rate_interval]))"
+ *         alias:
+ *           type: string
+ *           maxLength: 10000
+ *           description: Prefixed to every series name this expression produces.
+ *           example: "Requests"
+ *
+ *     PromqlInstantExpression:
+ *       description: >
+ *         A PromQL expression on a table, number, pie, or bar tile, which can be
+ *         evaluated at a single instant instead of over a range.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlRangeExpression'
+ *         - type: object
+ *           properties:
+ *             queryType:
+ *               type: string
+ *               enum: [range, instant]
+ *               description: >
+ *                 Whether to evaluate over the time range or at its end.
+ *                 Defaults to "range" when omitted.
+ *               example: "instant"
+ *
+ *     PromqlReducibleExpression:
+ *       description: >
+ *         A PromQL expression on a number, pie, or bar tile, which reduces each
+ *         series of a range query to a single value.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlInstantExpression'
+ *         - type: object
+ *           properties:
+ *             reducer:
+ *               type: string
+ *               enum: [lastNotNull, min, max, mean, sum, count]
+ *               description: >
+ *                 How each series' samples are reduced to one value. Defaults
+ *                 to "lastNotNull" when omitted. It also applies to instant
+ *                 queries, where each series has a single sample, so e.g.
+ *                 "count" turns every value into 1.
+ *               example: "max"
+ *
+ *     PromqlChartConfigBase:
+ *       type: object
+ *       required:
+ *         - configType
+ *         - sourceId
+ *       description: >
+ *         Shared fields for PromQL chart configs. Set configType to "promql" and
+ *         provide sourceId + expressions. The connection is read from the source.
+ *         PromQL is a preview feature and must be enabled on the deployment
+ *         (ENABLE_PROMQL) before PromQL tiles can be queried.
+ *       properties:
+ *         configType:
+ *           type: string
+ *           enum: [promql]
+ *           description: Must be "promql" to use the PromQL chart config variant.
+ *           example: "promql"
+ *         sourceId:
+ *           type: string
+ *           description: ID of the PromQL source to query. Must be a source of kind "promql".
+ *           example: "65f5e4a3b9e77c001a333333"
+ *         granularity:
+ *           type: string
+ *           pattern: '^(\d+ (second|minute|hour|day)|auto)$'
+ *           description: >
+ *             Resolution of range queries, used as the Prometheus step and the
+ *             $__interval macro. Defaults to "auto", which picks one from the
+ *             time range.
+ *           example: "5 minute"
+ *         numberFormat:
+ *           $ref: '#/components/schemas/NumberFormat'
+ *           description: Number formatting options for displayed values.
+ *
+ *     PromqlTimeChartConfigBase:
+ *       description: Shared fields for PromQL time-series chart configs.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - expressions
+ *           properties:
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: PromQL expressions to plot.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlRangeExpression'
+ *             legendTemplate:
+ *               type: string
+ *               maxLength: 1024
+ *               description: >
+ *                 Template for series names, using the series' Prometheus labels
+ *                 in double braces.
+ *               example: "{{job}} - {{instance}}"
+ *             fillNulls:
+ *               type: boolean
+ *               description: Fill missing time buckets with zero instead of leaving gaps.
+ *               default: true
+ *             alignDateRangeToGranularity:
+ *               type: boolean
+ *               description: Expand date range boundaries to the query granularity interval.
+ *               default: true
+ *             seriesLimit:
+ *               type: integer
+ *               minimum: 0
+ *               description: >
+ *                 Maximum number of series rendered (top-N by value). Omit to use
+ *                 the default render cap, set 0 for unlimited, or a positive N to
+ *                 keep the top N series.
+ *               example: 5
+ *
+ *     LinePromqlChartConfig:
+ *       description: PromQL configuration for a line time-series chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlTimeChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [line]
+ *               description: Display as a line time-series chart.
+ *               example: "line"
+ *             compareToPreviousPeriod:
+ *               type: boolean
+ *               description: Overlay the equivalent previous time period for comparison.
+ *               default: false
+ *             lineInterpolation:
+ *               type: string
+ *               enum: [smooth, linear, step]
+ *               example: "step"
+ *               description: >
+ *                 How points are connected. Defaults to "smooth" when omitted.
+ *
+ *     BarPromqlChartConfig:
+ *       description: PromQL configuration for a stacked-bar time-series chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlTimeChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [stacked_bar]
+ *               description: Display as a stacked-bar time-series chart.
+ *               example: "stacked_bar"
+ *
+ *     StackedLinePromqlChartConfig:
+ *       description: PromQL configuration for a stacked-line time-series chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlTimeChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [stacked_line]
+ *               description: Display as a stacked-line time-series chart.
+ *               example: "stacked_line"
+ *             lineInterpolation:
+ *               type: string
+ *               enum: [smooth, linear, step]
+ *               example: "step"
+ *               description: >
+ *                 How points are connected. Defaults to "linear" when omitted.
+ *
+ *     TablePromqlChartConfig:
+ *       description: >
+ *         PromQL configuration for a table chart, with one row per sample: a
+ *         column per label, a Value column, and a Timestamp column when the
+ *         expression is a range query. An instant query gives one row per
+ *         series.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *             - expressions
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [table]
+ *               description: Display as a table chart.
+ *               example: "table"
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: >
+ *                 PromQL expressions. Only the first is queried; the rest are
+ *                 kept but ignored.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlInstantExpression'
+ *
+ *     NumberPromqlChartConfig:
+ *       description: PromQL configuration for a single big-number chart.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *             - expressions
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [number]
+ *               description: Display as a single big-number chart.
+ *               example: "number"
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: >
+ *                 PromQL expressions. Only the first is queried; the rest are
+ *                 kept but ignored. The tile displays the first value.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlReducibleExpression'
+ *             color:
+ *               $ref: '#/components/schemas/ChartPaletteToken'
+ *               description: Optional static color applied to the displayed number.
+ *             colorRules:
+ *               type: array
+ *               maxItems: 10
+ *               description: >
+ *                 Ordered conditional color rules evaluated against the displayed
+ *                 value (last match wins). Falls back to color, then the default
+ *                 text color when no rule matches.
+ *               items:
+ *                 $ref: '#/components/schemas/NumberTileColorCondition'
+ *             backgroundChart:
+ *               $ref: '#/components/schemas/BackgroundChart'
+ *               description: >
+ *                 Optional trend sparkline drawn behind the number. Only rendered
+ *                 when the expression uses a range query.
+ *
+ *     PiePromqlChartConfig:
+ *       description: PromQL configuration for a pie chart, with one slice per series.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *             - expressions
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [pie]
+ *               description: Display as a pie chart.
+ *               example: "pie"
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: >
+ *                 PromQL expressions. Only the first is queried; the rest are
+ *                 kept but ignored.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlReducibleExpression'
+ *             legendTemplate:
+ *               type: string
+ *               maxLength: 1024
+ *               description: >
+ *                 Template for slice names, using the series' Prometheus labels
+ *                 in double braces.
+ *               example: "{{job}}"
+ *             limit:
+ *               type: integer
+ *               minimum: 0
+ *               description: >
+ *                 Maximum number of slices (top-N by value), at most 500. Omit
+ *                 or set 0 to show up to 500.
+ *               example: 10
+ *
+ *     CategoricalBarPromqlChartConfig:
+ *       description: PromQL configuration for a categorical bar chart, with one bar per series.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *             - expressions
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [bar]
+ *               description: Display as a categorical bar chart.
+ *               example: "bar"
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: >
+ *                 PromQL expressions. Only the first is queried; the rest are
+ *                 kept but ignored.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlReducibleExpression'
+ *             legendTemplate:
+ *               type: string
+ *               maxLength: 1024
+ *               description: >
+ *                 Template for bar names, using the series' Prometheus labels in
+ *                 double braces.
+ *               example: "{{job}}"
+ *             limit:
+ *               type: integer
+ *               minimum: 0
+ *               description: >
+ *                 Maximum number of bars (top-N by value), at most 500. Omit or
+ *                 set 0 to show up to 500.
+ *               example: 10
+ *
+ *     HeatmapPromqlChartConfig:
+ *       description: PromQL configuration for a heatmap.
+ *       allOf:
+ *         - $ref: '#/components/schemas/PromqlChartConfigBase'
+ *         - type: object
+ *           required:
+ *             - displayType
+ *             - expressions
+ *           properties:
+ *             displayType:
+ *               type: string
+ *               enum: [heatmap]
+ *               description: Display as a heatmap.
+ *               example: "heatmap"
+ *             expressions:
+ *               type: array
+ *               minItems: 1
+ *               maxItems: 10
+ *               description: >
+ *                 PromQL expressions. Only the first is queried; the rest are
+ *                 kept but ignored.
+ *               items:
+ *                 $ref: '#/components/schemas/PromqlRangeExpression'
+ *             heatmapMode:
+ *               type: string
+ *               enum: [distribution, series, histogram]
+ *               description: >
+ *                 "distribution" buckets the values of all series over time,
+ *                 "series" draws one row per series, and "histogram" draws one
+ *                 row per Prometheus histogram bucket (series need an "le"
+ *                 label). Defaults to "distribution" when omitted.
+ *               example: "histogram"
+ *             heatmapScaleType:
+ *               type: string
+ *               enum: [log, linear]
+ *               description: Y-axis scale of a distribution heatmap.
+ *               example: "log"
+ *             legendTemplate:
+ *               type: string
+ *               maxLength: 1024
+ *               description: >
+ *                 Template for row names of a series heatmap, using the series'
+ *                 Prometheus labels in double braces.
+ *               example: "{{job}}"
+ *
  *     LineChartConfig:
  *       description: >
  *         Line chart. Omit configType for the builder variant (requires sourceId
  *         and select). Set configType to "sql" for the Raw SQL variant (requires
- *         connectionId and sqlTemplate).
+ *         connectionId and sqlTemplate), or to "promql" for the PromQL variant
+ *         (requires sourceId and expressions).
  *       oneOf:
  *         - $ref: '#/components/schemas/LineBuilderChartConfig'
  *         - $ref: '#/components/schemas/LineRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/LinePromqlChartConfig'
  *       discriminator:
  *         propertyName: configType
  *         mapping:
  *           sql: '#/components/schemas/LineRawSqlChartConfig'
+ *           promql: '#/components/schemas/LinePromqlChartConfig'
  *
  *     BarChartConfig:
  *       description: >
  *         Stacked-bar chart. Omit configType for the builder variant (requires
  *         sourceId and select). Set configType to "sql" for the Raw SQL variant
- *         (requires connectionId and sqlTemplate).
+ *         (requires connectionId and sqlTemplate), or to "promql" for the PromQL
+ *         variant (requires sourceId and expressions).
  *       oneOf:
  *         - $ref: '#/components/schemas/BarBuilderChartConfig'
  *         - $ref: '#/components/schemas/BarRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/BarPromqlChartConfig'
  *       discriminator:
  *         propertyName: configType
  *         mapping:
  *           sql: '#/components/schemas/BarRawSqlChartConfig'
+ *           promql: '#/components/schemas/BarPromqlChartConfig'
+ *
+ *     StackedLineChartConfig:
+ *       description: >
+ *         Stacked-line chart. Omit configType for the builder variant (requires
+ *         sourceId and select). Set configType to "sql" for the Raw SQL variant
+ *         (requires connectionId and sqlTemplate), or to "promql" for the PromQL
+ *         variant (requires sourceId and expressions).
+ *       oneOf:
+ *         - $ref: '#/components/schemas/StackedLineBuilderChartConfig'
+ *         - $ref: '#/components/schemas/StackedLineRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/StackedLinePromqlChartConfig'
+ *       discriminator:
+ *         propertyName: configType
+ *         mapping:
+ *           sql: '#/components/schemas/StackedLineRawSqlChartConfig'
+ *           promql: '#/components/schemas/StackedLinePromqlChartConfig'
  *
  *     OnClickFilterTemplate:
  *       type: object
@@ -1077,6 +2055,27 @@ function getSourceConnectionMismatches(
  *           items:
  *             $ref: '#/components/schemas/OnClickFilterTemplate'
  *
+ *     OnClickExternal:
+ *       type: object
+ *       required: [type, urlTemplate]
+ *       description: >
+ *         Link-out that navigates to an arbitrary external URL (e.g. a Grafana
+ *         or Langfuse dashboard). The rendered URL must be an absolute http(s) URL.
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [external]
+ *           description: OnClick variant discriminator. Must be "external" for external link-outs.
+ *           example: "external"
+ *         urlTemplate:
+ *           type: string
+ *           minLength: 1
+ *           description: >
+ *             Handlebars template rendered against the clicked row; supports
+ *             `{{column}}` variables. The rendered value must be an absolute
+ *             http(s) URL.
+ *           example: "https://example.com/d/abc?var-service={{ServiceName}}"
+ *
  *     OnClick:
  *       description: >
  *         Link-out configuration applied when a user clicks a row of a table tile.
@@ -1086,78 +2085,113 @@ function getSourceConnectionMismatches(
  *       oneOf:
  *         - $ref: '#/components/schemas/OnClickSearch'
  *         - $ref: '#/components/schemas/OnClickDashboard'
+ *         - $ref: '#/components/schemas/OnClickExternal'
  *       discriminator:
  *         propertyName: type
  *         mapping:
  *           search: '#/components/schemas/OnClickSearch'
  *           dashboard: '#/components/schemas/OnClickDashboard'
+ *           external: '#/components/schemas/OnClickExternal'
  *
  *     TableChartConfig:
  *       description: >
  *         Table chart. Omit configType for the builder variant (requires sourceId
  *         and select). Set configType to "sql" for the Raw SQL variant (requires
- *         connectionId and sqlTemplate).
+ *         connectionId and sqlTemplate), or to "promql" for the PromQL variant
+ *         (requires sourceId and expressions).
  *       oneOf:
  *         - $ref: '#/components/schemas/TableBuilderChartConfig'
  *         - $ref: '#/components/schemas/TableRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/TablePromqlChartConfig'
  *       discriminator:
  *         propertyName: configType
  *         mapping:
  *           sql: '#/components/schemas/TableRawSqlChartConfig'
+ *           promql: '#/components/schemas/TablePromqlChartConfig'
  *
  *     NumberChartConfig:
  *       description: >
  *         Single big-number chart. Omit configType for the builder variant
  *         (requires sourceId and select). Set configType to "sql" for the Raw
- *         SQL variant (requires connectionId and sqlTemplate).
+ *         SQL variant (requires connectionId and sqlTemplate), or to "promql"
+ *         for the PromQL variant (requires sourceId and expressions).
  *       oneOf:
  *         - $ref: '#/components/schemas/NumberBuilderChartConfig'
  *         - $ref: '#/components/schemas/NumberRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/NumberPromqlChartConfig'
  *       discriminator:
  *         propertyName: configType
  *         mapping:
  *           sql: '#/components/schemas/NumberRawSqlChartConfig'
+ *           promql: '#/components/schemas/NumberPromqlChartConfig'
  *
  *     PieChartConfig:
  *       description: >
  *         Pie chart. Omit configType for the builder variant (requires sourceId
  *         and select). Set configType to "sql" for the Raw SQL variant (requires
- *         connectionId and sqlTemplate).
+ *         connectionId and sqlTemplate), or to "promql" for the PromQL variant
+ *         (requires sourceId and expressions).
  *       oneOf:
  *         - $ref: '#/components/schemas/PieBuilderChartConfig'
  *         - $ref: '#/components/schemas/PieRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/PiePromqlChartConfig'
  *       discriminator:
  *         propertyName: configType
  *         mapping:
  *           sql: '#/components/schemas/PieRawSqlChartConfig'
+ *           promql: '#/components/schemas/PiePromqlChartConfig'
+ *
+ *     CategoricalBarChartConfig:
+ *       description: >
+ *         Categorical bar chart (one bar per group value; not a time series).
+ *         Omit configType for the builder variant (requires sourceId and
+ *         select). Set configType to "sql" for the Raw SQL variant (requires
+ *         connectionId and sqlTemplate), or to "promql" for the PromQL variant
+ *         (requires sourceId and expressions).
+ *       oneOf:
+ *         - $ref: '#/components/schemas/CategoricalBarBuilderChartConfig'
+ *         - $ref: '#/components/schemas/CategoricalBarRawSqlChartConfig'
+ *         - $ref: '#/components/schemas/CategoricalBarPromqlChartConfig'
+ *       discriminator:
+ *         propertyName: configType
+ *         mapping:
+ *           sql: '#/components/schemas/CategoricalBarRawSqlChartConfig'
+ *           promql: '#/components/schemas/CategoricalBarPromqlChartConfig'
  *
  *     TileConfig:
  *       description: >
  *         Tile chart configuration. displayType is the primary discriminant and
- *         determines which variant group applies. For displayTypes that support
- *         both builder and Raw SQL modes (line, stacked_bar, table, number, pie),
- *         configType is the secondary discriminant: omit it for the builder
- *         variant or set it to "sql" for the Raw SQL variant. The heatmap,
- *         search, and markdown displayTypes only have a builder variant.
+ *         determines which variant group applies. configType is the secondary
+ *         discriminant: omit it for the builder variant, set it to "sql" for the
+ *         Raw SQL variant, or set it to "promql" for the PromQL variant. Line,
+ *         stacked_bar, stacked_line, table, number, pie, and bar support all
+ *         three. Heatmap supports builder and PromQL. Search, event_patterns,
+ *         and markdown only have a builder variant.
  *       oneOf:
  *         - $ref: '#/components/schemas/LineChartConfig'
  *         - $ref: '#/components/schemas/BarChartConfig'
+ *         - $ref: '#/components/schemas/StackedLineChartConfig'
  *         - $ref: '#/components/schemas/TableChartConfig'
  *         - $ref: '#/components/schemas/NumberChartConfig'
  *         - $ref: '#/components/schemas/PieChartConfig'
+ *         - $ref: '#/components/schemas/CategoricalBarChartConfig'
  *         - $ref: '#/components/schemas/HeatmapChartConfig'
  *         - $ref: '#/components/schemas/SearchChartConfig'
+ *         - $ref: '#/components/schemas/EventPatternsChartConfig'
  *         - $ref: '#/components/schemas/MarkdownChartConfig'
  *       discriminator:
  *         propertyName: displayType
  *         mapping:
  *           line: '#/components/schemas/LineChartConfig'
  *           stacked_bar: '#/components/schemas/BarChartConfig'
+ *           stacked_line: '#/components/schemas/StackedLineChartConfig'
  *           table: '#/components/schemas/TableChartConfig'
  *           number: '#/components/schemas/NumberChartConfig'
  *           pie: '#/components/schemas/PieChartConfig'
+ *           bar: '#/components/schemas/CategoricalBarChartConfig'
  *           heatmap: '#/components/schemas/HeatmapChartConfig'
  *           search: '#/components/schemas/SearchChartConfig'
+ *           event_patterns: '#/components/schemas/EventPatternsChartConfig'
  *           markdown: '#/components/schemas/MarkdownChartConfig'
  *
  *     DashboardContainerTab:
@@ -1272,6 +2306,11 @@ function getSourceConnectionMismatches(
  *           maxLength: 256
  *           description: References a tab inside the tile's container by id. Requires containerId to be set, and the container to declare a matching tab.
  *           example: "errors"
+ *         description:
+ *           type: string
+ *           maxLength: 1024
+ *           description: Short explanation of the tile, shown as a tooltip next to its name.
+ *           example: "Share of API requests that returned a 5xx response."
  *
  *     TileOutput:
  *       description: Response format for dashboard tiles
@@ -1317,8 +2356,31 @@ function getSourceConnectionMismatches(
  *                 $ref: '#/components/schemas/DashboardChartSeries'
  *
  *     FilterInput:
+ *       description: |
+ *         A drop-down filter on a dashboard. Depending on type, filters can either broadcast
+ *         selected value(s) to every tile (isBroadcastEnabled), expose selected
+ *         values as a variable (isVariableEnabled) or both. Typically a filter should
+ *         do just one of these things. Any filter may additionally be marked
+ *         required via minSelections, which blocks the tiles that read it until it
+ *         has a selected value - or every tile on the dashboard, with
+ *         isGlobalRequirement.
+ *       oneOf:
+ *         - $ref: '#/components/schemas/QueryExpressionFilterInput'
+ *         - $ref: '#/components/schemas/StaticListFilterInput'
+ *         - $ref: '#/components/schemas/PrometheusLabelFilterInput'
+ *       discriminator:
+ *         propertyName: type
+ *         mapping:
+ *           QUERY_EXPRESSION: '#/components/schemas/QueryExpressionFilterInput'
+ *           STATIC_LIST: '#/components/schemas/StaticListFilterInput'
+ *           PROMETHEUS_LABEL: '#/components/schemas/PrometheusLabelFilterInput'
+ *
+ *     QueryExpressionFilterInput:
  *       type: object
- *       description: Dashboard filter key that can be added to a dashboard
+ *       description: |
+ *         A filter whose dropdown values are queried from ClickHouse: "expression"
+ *         names the column and "sourceId" the source to read them from. Its
+ *         selection can be broadcast into matching tiles' WHERE clauses.
  *       required:
  *         - type
  *         - name
@@ -1328,7 +2390,7 @@ function getSourceConnectionMismatches(
  *         type:
  *           type: string
  *           enum: [QUERY_EXPRESSION]
- *           description: Filter type. Must be "QUERY_EXPRESSION".
+ *           description: Filter type discriminator. Must be "QUERY_EXPRESSION".
  *           example: "QUERY_EXPRESSION"
  *         name:
  *           type: string
@@ -1338,7 +2400,7 @@ function getSourceConnectionMismatches(
  *         expression:
  *           type: string
  *           minLength: 1
- *           description: Key expression used when applying this dashboard filter key
+ *           description: SQL expression used when querying values for this filter, and when applying this dashboard filter to tiles.
  *           example: "environment"
  *         sourceId:
  *           type: string
@@ -1368,8 +2430,259 @@ function getSourceConnectionMismatches(
  *             an empty array to apply the filter to ALL tiles regardless of source.
  *             A non-empty array restricts the filter to only tiles whose source ID
  *             is in the list; tiles using other sources are not affected by the
- *             selected filter value(s).
+ *             selected filter value(s). Scopes the broadcast condition only, so a
+ *             non-empty array is rejected when isBroadcastEnabled is false, and is
+ *             omitted from responses for such a filter.
  *           example: ["65f5e4a3b9e77c001a111111"]
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           description: |
+ *             Whether the selected value is applied as a filter condition on every
+ *             builder tile this filter applies to (see appliesToSourceIds), and every
+ *             raw sql tile using the $__filters macro. Omitting the field means enabled.
+ *           default: true
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           description: |
+ *             Whether the selected value is exposed to tile queries as a dashboard
+ *             variable named by variableName. Tiles may reference it as `$variableName`
+ *             or using the (preferred) `$__filter($<variableName>)` and
+ *             `$__conditionalAll(<condition>, $<variableName>)` macros.
+ *           default: false
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed, so a variable-enabled filter whose name derives nothing
+ *             usable must send this field explicitly. Variable names must be unique
+ *             across a dashboard's variable-enabled filters. Names the variable
+ *             only, so the field is rejected when isVariableEnabled is not true, and
+ *             is omitted from responses for such a filter.
+ *           example: "environment"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
+ *         maxSelections:
+ *           type: integer
+ *           enum: [1]
+ *           description: |
+ *             Maximum number of values that can be selected at once. Set to 1 to make
+ *             the filter single-select. Omit the field for the default multi-select
+ *             behavior.
+ *           example: 1
+ *
+ *     StaticListFilterInput:
+ *       type: object
+ *       description: |
+ *         A filter whose dropdown offers a static custom "options" list. It carries no
+ *         expression, so it cannot be broadcast, and supports only variable mode.
+ *       required:
+ *         - type
+ *         - name
+ *         - options
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [STATIC_LIST]
+ *           description: Discriminator. Must be "STATIC_LIST".
+ *           example: "STATIC_LIST"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           description: Display name for the dashboard filter key
+ *           example: "Environment"
+ *         options:
+ *           type: array
+ *           minItems: 1
+ *           maxItems: 1000
+ *           items:
+ *             type: string
+ *             minLength: 1
+ *             maxLength: 10000
+ *           description: |
+ *             The values this filter's dropdown offers. Must be non-empty and
+ *             free of duplicates.
+ *           example: ["prod", "staging", "dev"]
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           enum: [false]
+ *           default: false
+ *           description: |
+ *             Must be false — there is no expression to broadcast. Omit it and it
+ *             is false.
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           enum: [true]
+ *           default: true
+ *           description: |
+ *             Must be true if provided, and is true when omitted. Tiles reference
+ *             the selection as `$variableName`, or with the `$__filter(<expression>, $<variableName>)`
+ *             and `$__conditionalAll(<condition>, $<variableName>)` macros. The
+ *             one-argument `$__filter($<variableName>)` form renders the filter's
+ *             own expression, which this kind of filter does not have, so it
+ *             reports that the expression must be passed explicitly.
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed, so a variable-enabled filter whose name derives nothing
+ *             usable must send this field explicitly. Variable names must be unique
+ *             across a dashboard's variable-enabled filters. Names the variable
+ *             only, so the field is rejected when isVariableEnabled is not true, and
+ *             is omitted from responses for such a filter.
+ *           example: "environment"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
+ *         maxSelections:
+ *           type: integer
+ *           enum: [1]
+ *           description: |
+ *             Maximum number of values that can be selected at once. Set to 1 to make
+ *             the filter single-select. Omit the field for the default multi-select
+ *             behavior.
+ *           example: 1
+ *
+ *     PrometheusLabelFilterInput:
+ *       type: object
+ *       description: |
+ *         A filter whose dropdown lists the values for a Prometheus label,
+ *         read from a PromQL source over the dashboard's time range.
+ *         Supports variable mode only. PromQL is a preview feature and must be
+ *         enabled on the deployment (ENABLE_PROMQL) before these filters can
+ *         list values.
+ *       required:
+ *         - type
+ *         - name
+ *         - sourceId
+ *         - label
+ *       properties:
+ *         type:
+ *           type: string
+ *           enum: [PROMETHEUS_LABEL]
+ *           description: Discriminator. Must be "PROMETHEUS_LABEL".
+ *           example: "PROMETHEUS_LABEL"
+ *         name:
+ *           type: string
+ *           minLength: 1
+ *           description: Display name for the dashboard filter
+ *           example: "Pod"
+ *         sourceId:
+ *           type: string
+ *           description: |
+ *             Id of the PromQL source the label values are read from.
+ *           example: "65f5e4a3b9e77c001a123456"
+ *         label:
+ *           type: string
+ *           minLength: 1
+ *           maxLength: 1024
+ *           description: |
+ *             Label whose values populate the dropdown. Use "__name__" to list
+ *             metric names.
+ *           example: "pod"
+ *         match:
+ *           type: string
+ *           minLength: 1
+ *           description: |
+ *             Optional Prometheus series selector narrowing which series the
+ *             label values are read from.
+ *           example: 'up{job="api"}'
+ *         isBroadcastEnabled:
+ *           type: boolean
+ *           enum: [false]
+ *           default: false
+ *           description: Must be false or omitted.
+ *           example: false
+ *         isVariableEnabled:
+ *           type: boolean
+ *           enum: [true]
+ *           default: true
+ *           description: |
+ *             Must be true if provided, and is true when omitted. Tiles reference
+ *             the selection as `$variableName`.
+ *           example: true
+ *         variableName:
+ *           type: string
+ *           maxLength: 64
+ *           pattern: '^[a-zA-Z][a-zA-Z0-9_]*$'
+ *           description: |
+ *             Token that tiles reference this filter's selected value by, as
+ *             `$variableName`. Must start with a letter and may contain only
+ *             letters, numbers, and underscores. Defaults to the display name with
+ *             whitespace replaced by underscores and remaining illegal characters
+ *             removed. Variable names must be unique across a dashboard's
+ *             variable-enabled filters.
+ *           example: "pod"
+ *         minSelections:
+ *           type: integer
+ *           enum: [0, 1]
+ *           default: 0
+ *           description: |
+ *             Minimum number of values that must be selected before tiles load.
+ *             Set to 1 to make the filter required. Only 0 and 1 are accepted.
+ *             Omit the field (or send 0) for the default optional behavior.
+ *           example: 1
+ *         isGlobalRequirement:
+ *           type: boolean
+ *           default: false
+ *           description: |
+ *             Widens a required filter's block to every tile on the dashboard. False
+ *             (the default) blocks only the tiles that read the filter: those
+ *             referencing its variableName, and those its broadcast applies to.
+ *             Ignored unless minSelections is 1.
+ *           example: true
+ *         maxSelections:
+ *           type: integer
+ *           enum: [1]
+ *           description: |
+ *             Maximum number of values that can be selected at once. Set to 1 to make
+ *             the filter single-select. Omit the field for the default multi-select
+ *             behavior.
+ *           example: 1
  *
  *     Filter:
  *       allOf:
@@ -1410,7 +2723,10 @@ function getSourceConnectionMismatches(
  *           example: ["production", "monitoring"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys added to the dashboard and applied to all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/Filter'
  *         savedQuery:
@@ -1463,7 +2779,10 @@ function getSourceConnectionMismatches(
  *           example: ["development"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys to add to the dashboard and apply across all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/FilterInput'
  *         savedQuery:
@@ -1516,7 +2835,10 @@ function getSourceConnectionMismatches(
  *           example: ["production", "updated"]
  *         filters:
  *           type: array
- *           description: Dashboard filter keys on the dashboard, applied across all tiles
+ *           description: |
+ *             Dropdown filters added to the dashboard. Each one broadcasts
+ *             its selected value as a condition, acts as a variable which
+ *             can be referenced in tile queries, or both.
  *           items:
  *             $ref: '#/components/schemas/Filter'
  *         savedQuery:
@@ -1770,6 +3092,127 @@ router.get(
 
 /**
  * @openapi
+ * /api/v2/dashboards/validate:
+ *   post:
+ *     summary: Validate Dashboard
+ *     description: |
+ *       Validates a dashboard body against the same schema and tile rules used
+ *       by POST /api/v2/dashboards. The dashboard is **never persisted**. Use
+ *       this endpoint at plan time (e.g. from a Terraform provider) to check
+ *       that a dashboard configuration is valid before applying it.
+ *     operationId: validateDashboard
+ *     tags: [Dashboards]
+ *     requestBody:
+ *       required: true
+ *       content:
+ *         application/json:
+ *           schema:
+ *             $ref: '#/components/schemas/CreateDashboardRequest'
+ *     responses:
+ *       '200':
+ *         description: |
+ *           Validation result. HTTP 200 is always returned for valid **and**
+ *           invalid bodies — a non-200 response means the request itself
+ *           failed (auth, server error, etc.).
+ *         content:
+ *           application/json:
+ *             schema:
+ *               type: object
+ *               required: [valid, errors, normalized]
+ *               properties:
+ *                 valid:
+ *                   type: boolean
+ *                   description: True when the body passes all validation rules.
+ *                 errors:
+ *                   type: array
+ *                   description: Validation errors. Empty when valid is true.
+ *                   items:
+ *                     type: object
+ *                     required: [path, message]
+ *                     properties:
+ *                       path:
+ *                         type: string
+ *                         description: Dot-separated field path, or empty string for top-level errors.
+ *                       message:
+ *                         type: string
+ *                         description: Human-readable error description.
+ *                 normalized:
+ *                   type: object
+ *                   nullable: true
+ *                   description: |
+ *                     The parsed dashboard body with defaults applied (no
+ *                     persistence, so no server-assigned tile IDs). Populated
+ *                     when valid is true, null when valid is false.
+ *             examples:
+ *               valid:
+ *                 summary: Valid dashboard body
+ *                 value:
+ *                   valid: true
+ *                   errors: []
+ *                   normalized:
+ *                     name: "My Dashboard"
+ *                     tiles: []
+ *               invalid:
+ *                 summary: Invalid dashboard body
+ *                 value:
+ *                   valid: false
+ *                   errors:
+ *                     - path: "name"
+ *                       message: "Required"
+ *                   normalized: null
+ *       '401':
+ *         description: Unauthorized
+ *         content:
+ *           application/json:
+ *             schema:
+ *               $ref: '#/components/schemas/Error'
+ *             example:
+ *               message: "Unauthorized access. API key is missing or invalid."
+ */
+router.post('/validate', async (req, res, next) => {
+  try {
+    const teamId = req.user?.team;
+    if (teamId == null) {
+      return res.sendStatus(403);
+    }
+
+    const parsed = createDashboardBodySchema.safeParse(req.body);
+    if (!parsed.success) {
+      return res.json({
+        valid: false,
+        errors: parsed.error.issues.map(i => ({
+          path: i.path.join('.'),
+          message: i.message,
+        })),
+        normalized: null,
+      });
+    }
+
+    const { tiles, filters, containers } = parsed.data;
+    // Cast: createDashboardBodySchema tiles have optional `id`; the validator
+    // only reads sourceId/config — the cast is safe for a no-persist call.
+    const validationError = await validateDashboardTiles({
+      teamId: teamId.toString(),
+      tiles: tiles as ExternalDashboardTileWithId[],
+      filters,
+      containers: containers ?? [],
+    });
+    if (validationError) {
+      return res.json({
+        valid: false,
+        errors: [{ path: '', message: validationError }],
+        normalized: null,
+      });
+    }
+
+    return res.json({ valid: true, errors: [], normalized: parsed.data });
+  } catch (e) {
+    next(e);
+  }
+});
+
+/**
+ * @openapi
  * /api/v2/dashboards:
  *   post:
  *     summary: Create Dashboard
@@ -1840,6 +3283,12 @@ router.get(
  *                     name: "Service"
  *                     expression: "service_name"
  *                     sourceId: "65f5e4a3b9e77c001a111111"
+ *                   - type: "STATIC_LIST"
+ *                     name: "Environment"
+ *                     options: ["prod", "staging", "dev"]
+ *                     isBroadcastEnabled: false
+ *                     isVariableEnabled: true
+ *                     variableName: "env"
  *     responses:
  *       '200':
  *         description: Successfully created dashboard
@@ -1922,90 +3371,14 @@ router.post(
         containers,
       } = req.body;
 
-      // Tile-level container/tab ref resolution: container structure
-      // (duplicate ids, tab uniqueness) was checked by the body schema;
-      // tile-resolution runs here against the request body's containers
-      // (POST has no existing dashboard to fall back to).
-      const tileRefIssues = collectTileContainerRefIssues(
-        containers ?? [],
+      const validationError = await validateDashboardTiles({
+        teamId: teamId.toString(),
         tiles,
-      );
-      if (tileRefIssues.length > 0) {
-        return res.status(400).json({
-          message: tileRefIssues.join('; '),
-        });
-      }
-
-      // Hoist the source fetch so the source-derived validators
-      // (missing sources, source/connection mismatch, heatmap source
-      // kind) reuse one query result instead of each re-running
-      // `getSources(team)`. onClick helpers stay separate because
-      // they own their own dashboard lookup as well as a sources
-      // lookup; firing them inside the same Promise.all keeps the
-      // request latency unchanged.
-      const [
-        sources,
-        missingConnections,
-        missingOnClickDashboards,
-        invalidOnClickSearchSources,
-      ] = await Promise.all([
-        fetchSourcesForValidation(teamId),
-        getMissingConnections(teamId, tiles),
-        getMissingOnClickDashboards(teamId, tiles),
-        getInvalidOnClickSearchSources(teamId, tiles),
-      ]);
-
-      const missingSources = getMissingSources(sources, tiles, filters);
-      const sourceConnectionMismatches = getSourceConnectionMismatches(
-        sources,
-        tiles,
-      );
-      const heatmapNonTraceSources = getHeatmapTilesWithIncompatibleSources(
-        sources,
-        tiles,
-      );
-
-      if (missingSources.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following source IDs: ${missingSources.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (missingConnections.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following connection IDs: ${missingConnections.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (sourceConnectionMismatches.length > 0) {
-        return res.status(400).json({
-          message: `The following source IDs do not match the specified connections: ${sourceConnectionMismatches.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (heatmapNonTraceSources.length > 0) {
-        return res.status(400).json({
-          message: `Heatmap tiles require a Trace source. The following source IDs are not Trace sources: ${heatmapNonTraceSources.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (missingOnClickDashboards.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following onClick dashboard IDs: ${missingOnClickDashboards.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (invalidOnClickSearchSources.length > 0) {
-        return res.status(400).json({
-          message: `The following onClick search source IDs are not log or trace sources: ${invalidOnClickSearchSources.join(
-            ', ',
-          )}`,
-        });
+        filters,
+        containers: containers ?? [],
+      });
+      if (validationError) {
+        return res.status(400).json({ message: validationError });
       }
 
       const internalTiles = convertExternalTilesToInternal(tiles);
@@ -2027,6 +3400,8 @@ router.post(
         team: teamId,
         ...(containers !== undefined ? { containers } : {}),
       }).save();
+
+      recordDashboardOnboardingIfHasTiles(req.user?._id, newDashboard.tiles);
 
       res.json({
         data: convertToExternalDashboard(newDashboard),
@@ -2212,121 +3587,34 @@ router.put(
         containers,
       } = req.body ?? {};
 
-      // Hoist the source fetch and the existing-dashboard read so the
-      // source-derived validators reuse one query result and the
-      // heatmap source-kind check can scope itself to tiles whose
-      // sourceId/displayType actually changed in this request (a
-      // source whose `kind` was changed after the dashboard was
-      // originally accepted shouldn't wedge unrelated edits). onClick
-      // helpers stay separate because they own their own dashboard
-      // lookup as well as a sources lookup; firing them inside the
-      // same Promise.all keeps the request latency unchanged.
-      const [
-        sources,
-        missingConnections,
-        missingOnClickDashboards,
-        invalidOnClickSearchSources,
-        existingDashboard,
-      ] = await Promise.all([
-        fetchSourcesForValidation(teamId),
-        getMissingConnections(teamId, tiles),
-        getMissingOnClickDashboards(teamId, tiles),
-        getInvalidOnClickSearchSources(teamId, tiles),
-        Dashboard.findOne(
-          { _id: dashboardId, team: teamId },
-          { tiles: 1, filters: 1, containers: 1 },
-        ).lean(),
-      ]);
+      const existingDashboard = await Dashboard.findOne(
+        { _id: dashboardId, team: teamId },
+        { tiles: 1, filters: 1, containers: 1 },
+      ).lean();
 
-      const missingSources = getMissingSources(sources, tiles, filters);
-      const sourceConnectionMismatches = getSourceConnectionMismatches(
-        sources,
+      if (existingDashboard == null) {
+        return res.sendStatus(404);
+      }
+
+      const effectiveContainers =
+        containers ?? existingDashboard.containers ?? [];
+      const validationError = await validateDashboardTiles({
+        teamId: teamId.toString(),
         tiles,
-      );
-      const heatmapNonTraceSources = getHeatmapTilesWithIncompatibleSources(
-        sources,
-        filterChangedHeatmapTiles(tiles, existingDashboard?.tiles ?? []),
-      );
-
-      if (missingSources.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following source IDs: ${missingSources.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (missingConnections.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following connection IDs: ${missingConnections.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (sourceConnectionMismatches.length > 0) {
-        return res.status(400).json({
-          message: `The following source IDs do not match the specified connections: ${sourceConnectionMismatches.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (heatmapNonTraceSources.length > 0) {
-        return res.status(400).json({
-          message: `Heatmap tiles require a Trace source. The following source IDs are not Trace sources: ${heatmapNonTraceSources.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (missingOnClickDashboards.length > 0) {
-        return res.status(400).json({
-          message: `Could not find the following onClick dashboard IDs: ${missingOnClickDashboards.join(
-            ', ',
-          )}`,
-        });
-      }
-      if (invalidOnClickSearchSources.length > 0) {
-        return res.status(400).json({
-          message: `The following onClick search source IDs are not log or trace sources: ${invalidOnClickSearchSources.join(
-            ', ',
-          )}`,
-        });
+        filters,
+        existingTiles: existingDashboard.tiles ?? [],
+        containers: effectiveContainers,
+      });
+      if (validationError) {
+        return res.status(400).json({ message: validationError });
       }
 
-      // PUT performs a read-modify-write on the dashboard doc with no
-      // optimistic-concurrency check (no `If-Match` / `updatedAt`
-      // guard). Concurrent PUTs may silently overwrite each other,
-      // which can leave orphan tile->container refs on layout-shape
-      // edits. The endpoint contract is at-most-one-writer; the
-      // OpenAPI description above documents this. Adding ETag-style
-      // concurrency would be a breaking change to the request shape
-      // and is tracked separately. `existingDashboard` is fetched in
-      // the hoisted Promise.all above and reused here for tile-ref
-      // resolution against the effective container set.
       const existingTileIds = new Set(
-        (existingDashboard?.tiles ?? []).map((t: { id: string }) => t.id),
+        (existingDashboard.tiles ?? []).map((t: { id: string }) => t.id),
       );
       const existingFilterIds = new Set(
-        (existingDashboard?.filters ?? []).map((f: { id: string }) => f.id),
+        (existingDashboard.filters ?? []).map((f: { id: string }) => f.id),
       );
-
-      // Tile-level container/tab ref resolution: container structure
-      // was checked by the body schema; tile-resolution runs here
-      // against the effective container set so an omitted `containers`
-      // body field (which preserves the existing array on write) is
-      // resolved against the doc's existing containers rather than an
-      // empty fallback. Without this, a PUT that updates only `tiles`
-      // and leaves a tile pointing at a real preserved container
-      // would be rejected with "Tile references unknown containerId".
-      const effectiveContainers =
-        containers ?? existingDashboard?.containers ?? [];
-      const tileRefIssues = collectTileContainerRefIssues(
-        effectiveContainers,
-        tiles,
-      );
-      if (tileRefIssues.length > 0) {
-        return res.status(400).json({
-          message: tileRefIssues.join('; '),
-        });
-      }
 
       const internalTiles = convertExternalTilesToInternal(
         tiles,
@@ -2380,6 +3668,11 @@ router.put(
         internalTiles,
         existingTileIds,
       });
+
+      recordDashboardOnboardingIfHasTiles(
+        req.user?._id,
+        updatedDashboard.tiles,
+      );
 
       res.json({
         data: convertToExternalDashboard(updatedDashboard),

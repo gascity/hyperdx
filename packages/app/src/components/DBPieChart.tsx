@@ -1,26 +1,18 @@
-import { memo, useMemo } from 'react';
+import { memo } from 'react';
+import cx from 'classnames';
 import { Cell, Pie, PieChart, ResponsiveContainer, Tooltip } from 'recharts';
-import { isBuilderChartConfig } from '@hyperdx/common-utils/dist/guards';
-import { ChartConfigWithOptTimestamp } from '@hyperdx/common-utils/dist/types';
 import { Box, Flex, ScrollArea, Text } from '@mantine/core';
 
-import {
-  buildMVDateRangeIndicator,
-  convertToPieChartConfig,
-  formatResponseForPieChart,
-} from '@/ChartUtils';
-import { useQueriedChartConfig } from '@/hooks/useChartConfig';
-import { useMVOptimizationExplanation } from '@/hooks/useMVOptimizationExplanation';
-import { useSingleSeriesNumberFormat, useSource } from '@/source';
 import type { NumberFormat } from '@/types';
-import { formatNumber, getColorProps, truncateMiddle } from '@/utils';
+import { formatNumber, truncateMiddle } from '@/utils';
 
+import {
+  CategoricalChartProps,
+  useCategoricalChart,
+} from './charts/CategoricalChart';
 import ChartContainer from './charts/ChartContainer';
-import ChartErrorState, {
-  ChartErrorStateVariant,
-} from './charts/ChartErrorState';
+import ChartErrorState from './charts/ChartErrorState';
 import { ChartTooltipContainer, ChartTooltipItem } from './charts/ChartTooltip';
-import MVOptimizationIndicator from './MaterializedViews/MVOptimizationIndicator';
 
 const PieChartTooltip = memo(
   ({
@@ -96,105 +88,22 @@ const PieChartLegend = memo(
   },
 );
 
-export const DBPieChart = ({
-  config,
-  title,
-  enabled = true,
-  queryKeyPrefix,
-  showMVOptimizationIndicator = true,
-  toolbarPrefix,
-  toolbarSuffix,
-  errorVariant,
-}: {
-  config: ChartConfigWithOptTimestamp;
-  title?: React.ReactNode;
-  enabled?: boolean;
-  queryKeyPrefix?: string;
-  showMVOptimizationIndicator?: boolean;
-  toolbarPrefix?: React.ReactNode[];
-  toolbarSuffix?: React.ReactNode[];
-  errorVariant?: ChartErrorStateVariant;
-}) => {
-  const { data: source } = useSource({
-    id: config.source,
-  });
-
-  const queriedConfig = useMemo(() => {
-    return isBuilderChartConfig(config)
-      ? convertToPieChartConfig(config)
-      : config;
-  }, [config]);
-
-  const resolvedNumberFormat = useSingleSeriesNumberFormat(queriedConfig);
-
-  const builderQueriedConfig = isBuilderChartConfig(queriedConfig)
-    ? queriedConfig
-    : undefined;
-  const { data: mvOptimizationData } =
-    useMVOptimizationExplanation(builderQueriedConfig);
-
-  const { data, isLoading, isError, error } = useQueriedChartConfig(
-    queriedConfig,
-    {
-      placeholderData: (prev: any) => prev,
-      queryKey: [queryKeyPrefix, queriedConfig],
-      enabled,
-    },
-  );
-
-  const toolbarItemsMemo = useMemo(() => {
-    const allToolbarItems = [];
-
-    if (toolbarPrefix && toolbarPrefix.length > 0) {
-      allToolbarItems.push(...toolbarPrefix);
-    }
-
-    if (source && showMVOptimizationIndicator && builderQueriedConfig) {
-      allToolbarItems.push(
-        <MVOptimizationIndicator
-          key="db-table-chart-mv-indicator"
-          config={builderQueriedConfig}
-          source={source}
-          variant="icon"
-        />,
-      );
-    }
-
-    const dateRangeIndicator = buildMVDateRangeIndicator({
-      mvOptimizationData,
-      originalDateRange: queriedConfig.dateRange,
-    });
-
-    if (dateRangeIndicator) {
-      allToolbarItems.push(dateRangeIndicator);
-    }
-
-    if (toolbarSuffix && toolbarSuffix.length > 0) {
-      allToolbarItems.push(...toolbarSuffix);
-    }
-
-    return allToolbarItems;
-  }, [
-    toolbarPrefix,
-    toolbarSuffix,
-    source,
-    showMVOptimizationIndicator,
-    mvOptimizationData,
-    queriedConfig,
-    builderQueriedConfig,
-  ]);
-
-  const [pieChartData, responseFormatError] = useMemo(() => {
-    if (!data) return [[], null];
-    try {
-      return [formatResponseForPieChart(data, getColorProps), null];
-    } catch (error) {
-      return [[], error instanceof Error ? error : new Error(String(error))];
-    }
-  }, [data]);
+export const DBPieChart = (props: CategoricalChartProps) => {
+  const { title, errorVariant } = props;
+  const {
+    resolvedNumberFormat,
+    toolbarItems,
+    data,
+    isLoading,
+    isPlaceholderData,
+    isError,
+    error,
+    chartData,
+    responseFormatError,
+  } = useCategoricalChart(props);
 
   return (
-    <ChartContainer title={title} toolbarItems={toolbarItemsMemo}>
+    <ChartContainer title={title} toolbarItems={toolbarItems}>
       {isLoading && !data ? (
         <div className="d-flex h-100 w-100 align-items-center justify-content-center text-muted">
           Loading Chart Data...
@@ -204,7 +113,12 @@ export const DBPieChart = ({
       ) : responseFormatError ? (
         <ChartErrorState error={responseFormatError} variant={errorVariant} />
       ) : data?.data.length === 0 ? (
-        <div className="d-flex h-100 w-100 align-items-center justify-content-center text-muted">
+        <div
+          className={cx(
+            'd-flex h-100 w-100 align-items-center justify-content-center text-muted',
+            { 'effect-pulse': isPlaceholderData },
+          )}
+        >
           No data found within time range.
         </div>
       ) : (
@@ -214,22 +128,20 @@ export const DBPieChart = ({
           justify="center"
           h="100%"
           style={{ flexGrow: 1, overflow: 'hidden' }}
+          // Pulse the pie and its legend together: the legend shows values too
+          className={isLoading || isPlaceholderData ? 'effect-pulse' : ''}
         >
-          <ResponsiveContainer
-            height="100%"
-            width="100%"
-            className={isLoading ? 'effect-pulse' : ''}
-          >
+          <ResponsiveContainer height="100%" width="100%">
             <PieChart>
               <Pie
                 cx="50%"
                 cy="50%"
-                data={pieChartData}
+                data={chartData}
                 dataKey="value"
                 fill="#8884d8"
                 nameKey="label"
               >
-                {pieChartData.map(entry => (
+                {chartData.map(entry => (
                   <Cell key={entry.label} fill={entry.color} stroke="none" />
                 ))}
               </Pie>
@@ -241,7 +153,7 @@ export const DBPieChart = ({
             </PieChart>
           </ResponsiveContainer>
           <PieChartLegend
-            data={pieChartData}
+            data={chartData}
             numberFormat={resolvedNumberFormat}
           />
         </Flex>

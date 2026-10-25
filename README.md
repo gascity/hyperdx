@@ -1,15 +1,21 @@
 <p align="center">
   <a href="https://hyperdx.io">
-    <picture>
-      <source media="(prefers-color-scheme: dark)" srcset="./.github/images/logo_dark.png#gh-dark-mode-only">
-      <img alt="hyperdx logo" src="./.github/images/logo_light.png#gh-light-mode-only">
-    </picture>
+    <img alt="hyperdx logo" src="./packages/app/public/favicons/hyperdx/favicon.svg" width="128">
   </a>
 </p>
 
----
+<h1 align="center">HyperDX</h1>
 
-# HyperDX
+<p align="center">
+  <a href="https://github.com/hyperdxio/hyperdx/stargazers"><img src="https://badgen.net/github/stars/hyperdxio/hyperdx?label=%E2%98%85" alt="GitHub stars" /></a>
+  <img src="https://badgen.net/github/license/hyperdxio/hyperdx" alt="License" />
+  <a href="https://github.com/hyperdxio/hyperdx/actions/workflows/release.yml"><img src="https://github.com/hyperdxio/hyperdx/actions/workflows/release.yml/badge.svg" alt="Release" /></a>
+  <a href="https://hyperdx.io/discord"><img src="https://img.shields.io/badge/Discord-5865F2?logo=discord&logoColor=white" alt="Join the HyperDX Discord" /></a>
+</p>
+
+<p align="center">
+  <a href="https://trendshift.io/repositories/2030?utm_source=repository-badge&utm_medium=badge&utm_campaign=badge-repository-2030" target="_blank" rel="noopener noreferrer"><img src="https://trendshift.io/api/badge/repositories/2030" alt="hyperdxio%2Fhyperdx | Trendshift" width="250" height="55"/></a>
+</p>
 
 [HyperDX](https://hyperdx.io), a core component of
 [ClickStack](https://clickhouse.com/use-cases/observability), helps engineers
@@ -104,6 +110,26 @@ include:
 Once HyperDX is running, you can point your OpenTelemetry SDK to the
 OpenTelemetry collector spun up at `http://localhost:4318`.
 
+## HyperDX CLI
+
+Prefer the terminal? [`@hyperdx/cli`](./packages/cli) provides an interactive
+TUI and CLI (`hdx`) for working with your HyperDX data without leaving the
+shell:
+
+```bash
+npm install -g @hyperdx/cli
+hdx auth login
+hdx tui
+```
+
+- 🖥️ Interactive TUI — search, live tail, and trace waterfalls with vim-style
+  keybindings
+- 📊 Render dashboard tiles and ad-hoc charts as ANSI output in the terminal
+- 🤖 Agent-friendly: raw SQL queries, NDJSON output, and Drain log pattern
+  mining for scripts and AI agents
+
+See the [CLI README](./packages/cli#readme) for the full command reference.
+
 ## Contributing
 
 We welcome all contributions! There's many ways to contribute to the project,
@@ -114,6 +140,14 @@ including but not limited to:
 - Improving our product or contribution documentation
 - Voting on [open issues](https://github.com/hyperdxio/hyperdx/issues) or
   contributing use cases to a feature request
+
+**Pull requests.** Issues, bug reports and discussion stay open to everyone. For
+code we now use [Vouch](https://github.com/mitchellh/vouch): a maintainer has to
+vouch for you before your first pull request gets reviewed. AI tools make it
+cheap to open a plausible-looking PR with no understanding behind it, and
+reviewing those crowds out the contributions we want to spend time on. There's
+nothing to request up front: open your first PR and a maintainer vouches for you
+on it. See [Getting vouched](./CONTRIBUTING.md#getting-vouched).
 
 ## Motivation
 

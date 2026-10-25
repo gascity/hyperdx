@@ -3,11 +3,17 @@ import router from 'next/router';
 import { Controller, useForm, useWatch } from 'react-hook-form';
 import { z } from 'zod';
 import { zodResolver } from '@hookform/resolvers/zod';
+import {
+  clampAlertDisplayName,
+  clampAlertTags,
+} from '@hyperdx/common-utils/dist/alerts';
 import { tcFromSource } from '@hyperdx/common-utils/dist/core/metadata';
 import {
   type Alert,
+  alertDisplayNameSchema,
   AlertIntervalSchema,
   AlertSource,
+  alertTagsSchema,
   AlertThresholdType,
   Filter,
   isRangeThresholdType,
@@ -16,7 +22,7 @@ import {
   SearchConditionLanguage,
   validateAlertScheduleOffsetMinutes,
   validateAlertThresholdMax,
-  zAlertChannel,
+  zAlertChannels,
 } from '@hyperdx/common-utils/dist/types';
 import {
   Accordion,
@@ -53,8 +59,10 @@ import {
   ALERT_THRESHOLD_TYPE_OPTIONS,
   intervalToMinutes,
   normalizeNoOpAlertScheduleFields,
+  toAlertChannels,
 } from '@/utils/alerts';
 
+import { AlertDisplayFields } from './components/AlertDisplayFields';
 import { AlertNoteField } from './components/AlertNoteField';
 import { AlertPreviewChart } from './components/AlertPreviewChart';
 import { AlertChannelForm } from './components/Alerts';
@@ -76,7 +84,12 @@ const SavedSearchAlertFormSchema = z
     scheduleOffsetMinutes: z.number().int().min(0).default(0),
     scheduleStartAt: scheduleStartAtSchema,
     thresholdType: z.nativeEnum(AlertThresholdType),
-    channel: zAlertChannel,
+    channels: zAlertChannels,
+    displayName: alertDisplayNameSchema,
+    tags: alertTagsSchema,
+    // nullish() (not optional()): persisted alerts store this as null, which
+    // optional() would reject.
+    numConsecutiveWindows: z.number().int().min(1).nullish(),
   })
   .passthrough()
   .superRefine(validateAlertScheduleOffsetMinutes)
@@ -89,9 +102,11 @@ const AlertForm = ({
   filters,
   select,
   defaultValues,
+  prefill,
   loading,
   deleteLoading,
   hasSavedSearch,
+  savedSearchName,
   onDelete,
   onSubmit,
   onClose,
@@ -102,9 +117,12 @@ const AlertForm = ({
   filters?: Filter[] | null;
   select?: string | null;
   defaultValues?: null | AlertWithCreatedBy;
+  /** Seed values for a brand-new alert */
+  prefill?: { displayName?: string; tags?: string[] };
   loading?: boolean;
   deleteLoading?: boolean;
   hasSavedSearch?: boolean;
+  savedSearchName?: string;
   onDelete: (id: string) => void;
   onSubmit: (data: Alert) => void;
   onClose: () => void;
@@ -120,8 +138,12 @@ const AlertForm = ({
     defaultValues: defaultValues
       ? {
           ...defaultValues,
+          channels: toAlertChannels(defaultValues),
           scheduleOffsetMinutes: defaultValues.scheduleOffsetMinutes ?? 0,
           scheduleStartAt: defaultValues.scheduleStartAt ?? null,
+          // Persisted null -> undefined for the NumberInput.
+          numConsecutiveWindows:
+            defaultValues.numConsecutiveWindows ?? undefined,
         }
       : {
           interval: '5m',
@@ -130,18 +152,16 @@ const AlertForm = ({
           scheduleStartAt: null,
           thresholdType: AlertThresholdType.ABOVE,
           source: AlertSource.SAVED_SEARCH,
-          channel: {
-            type: 'webhook',
-            webhookId: '',
-          },
+          channels: [{ type: 'webhook', webhookId: '' }],
           note: null,
+          displayName: prefill?.displayName,
+          tags: prefill?.tags,
         },
     resolver: zodResolver(SavedSearchAlertFormSchema),
   });
 
   const groupBy = useWatch({ control, name: 'groupBy' });
   const thresholdType = useWatch({ control, name: 'thresholdType' });
-  const channelType = useWatch({ control, name: 'channel.type' });
   const interval = useWatch({ control, name: 'interval' });
   const scheduleOffsetMinutes = useWatch({
     control,
@@ -150,6 +170,10 @@ const AlertForm = ({
   const groupByValue = useWatch({ control, name: 'groupBy' });
   const threshold = useWatch({ control, name: 'threshold' });
   const thresholdMax = useWatch({ control, name: 'thresholdMax' });
+  const numConsecutiveWindows = useWatch({
+    control,
+    name: 'numConsecutiveWindows',
+  });
   const maxScheduleOffsetMinutes = Math.max(
     intervalToMinutes(interval ?? '5m') - 1,
     0,
@@ -163,17 +187,35 @@ const AlertForm = ({
     <form
       onSubmit={handleSubmit(data =>
         onSubmit(
-          normalizeNoOpAlertScheduleFields(data, defaultValues, {
-            preserveExplicitScheduleOffsetMinutes:
-              dirtyFields.scheduleOffsetMinutes === true,
-            preserveExplicitScheduleStartAt:
-              dirtyFields.scheduleStartAt === true,
-          }),
+          normalizeNoOpAlertScheduleFields(
+            // `id` is not a registered form field, so carry it from the alert
+            // this form was opened with. This binds the submission to the
+            // originally-edited alert rather than whatever the parent's alerts
+            // list happens to index at submit time.
+            // `channel` is cleared (JSON drops undefined): the API derives it
+            // from channels[0], and echoing a stale value back would conflict
+            // with an edited list.
+            { ...data, channel: undefined, id: defaultValues?.id },
+            defaultValues,
+            {
+              preserveExplicitScheduleOffsetMinutes:
+                dirtyFields.scheduleOffsetMinutes === true,
+              preserveExplicitScheduleStartAt:
+                dirtyFields.scheduleStartAt === true,
+            },
+          ),
         ),
       )}
     >
       <Paper px="sm" py="xs" radius="xs">
         <Stack gap="xs">
+          <AlertDisplayFields
+            control={control}
+            displayNameName="displayName"
+            tagsName="tags"
+            derivedDisplayName={savedSearchName}
+            labelMarginTop="0"
+          />
           <Text size="xxs" opacity={0.5}>
             Trigger
           </Text>
@@ -246,7 +288,7 @@ const AlertForm = ({
             </Text>
             <Controller
               control={control}
-              name="channel.type"
+              name="channels.0.type"
               render={({ field }) => (
                 <NativeSelect
                   data={optionsToSelectData(ALERT_CHANNEL_OPTIONS)}
@@ -264,12 +306,15 @@ const AlertForm = ({
             scheduleOffsetMinutes={scheduleOffsetMinutes}
             maxScheduleOffsetMinutes={maxScheduleOffsetMinutes}
             offsetWindowLabel={`from each ${intervalLabel} window`}
+            numConsecutiveWindowsName="numConsecutiveWindows"
+            numConsecutiveWindows={numConsecutiveWindows ?? undefined}
           />
           <Text size="xxs" opacity={0.5} mb={4} mt="xs">
             grouped by
           </Text>
           <SQLInlineEditorControlled
             tableConnection={tcFromSource(source)}
+            sourceId={sourceId ?? undefined}
             control={control}
             name={`groupBy`}
             placeholder="SQL Columns"
@@ -279,7 +324,7 @@ const AlertForm = ({
           <Text size="xxs" opacity={0.5} mb={4}>
             Send to
           </Text>
-          <AlertChannelForm control={control} type={channelType} />
+          <AlertChannelForm control={control} channelsName="channels" />
           <AlertNoteField control={control} name="note" />
           {groupBy &&
             (thresholdType === AlertThresholdType.BELOW ||
@@ -460,7 +505,7 @@ export const DBSearchPageAlertModal = ({
           filters: searchedConfig.filters ?? [],
           tags: [],
         });
-        await createAlert.mutate({
+        await createAlert.mutateAsync({
           ...data,
           source: AlertSource.SAVED_SEARCH,
           savedSearchId: result.id,
@@ -470,14 +515,17 @@ export const DBSearchPageAlertModal = ({
       } else if (id) {
         // Create new alert
         if (activeIndex === 'stage') {
-          await createAlert.mutate({
+          await createAlert.mutateAsync({
             ...data,
             source: AlertSource.SAVED_SEARCH,
             savedSearchId: id,
           });
         } else if (data.id) {
-          // Update existing alert
-          await updateAlert.mutate({
+          // Update existing alert. `data.id` is the id of the alert the form
+          // was opened with (carried through by AlertForm), not a live
+          // re-index of the alerts list, so edits always target the intended
+          // alert even if the list changes while the modal is open.
+          await updateAlert.mutateAsync({
             ...data,
             id: data.id,
             source: AlertSource.SAVED_SEARCH,
@@ -506,7 +554,7 @@ export const DBSearchPageAlertModal = ({
 
   const onDelete = async (id: string) => {
     try {
-      await deleteAlert.mutate(id);
+      await deleteAlert.mutateAsync(id);
       notifications.show({
         color: 'green',
         message: 'Alert deleted!',
@@ -565,7 +613,7 @@ export const DBSearchPageAlertModal = ({
             {(savedSearch?.alerts || []).map((alert, index) => (
               <Tabs.Tab key={alert.id} value={`${index}`}>
                 <Group gap="xs">
-                  {getWebhookChannelIcon(alert.channel.type)}
+                  {getWebhookChannelIcon(alert.channel?.type)}
                   Alert {index + 1}
                   <AlertStatusIcon alerts={[alert]} />
                 </Group>
@@ -583,6 +631,15 @@ export const DBSearchPageAlertModal = ({
         <AlertForm
           key={activeIndex}
           hasSavedSearch={!!savedSearch}
+          savedSearchName={savedSearch?.name}
+          prefill={
+            savedSearch
+              ? {
+                  displayName: clampAlertDisplayName(savedSearch.name),
+                  tags: clampAlertTags(savedSearch.tags),
+                }
+              : undefined
+          }
           sourceId={searchedConfig?.source}
           where={searchedConfig?.where}
           whereLanguage={searchedConfig?.whereLanguage}

@@ -1,11 +1,15 @@
 import express from 'express';
 
+import { EXTERNAL_API_RATE_LIMIT_MAX } from '@/config';
 import { validateUserAccessKey } from '@/middleware/auth';
 import alertsRouter from '@/routers/external-api/v2/alerts';
 import chartsRouter from '@/routers/external-api/v2/charts';
+import connectionsRouter from '@/routers/external-api/v2/connections';
 import dashboardRouter from '@/routers/external-api/v2/dashboards';
+import savedSearchesRouter from '@/routers/external-api/v2/savedSearches';
 import searchRouter from '@/routers/external-api/v2/search';
 import sourcesRouter from '@/routers/external-api/v2/sources';
+import teamRouter from '@/routers/external-api/v2/team';
 import webhooksRouter from '@/routers/external-api/v2/webhooks';
 import rateLimiter, { rateLimiterKeyGenerator } from '@/utils/rateLimiter';
 
@@ -13,13 +17,13 @@ const router = express.Router();
 
 const defaultRateLimiter = rateLimiter({
   windowMs: 60 * 1000, // 1 minute
-  max: 100, // Limit each API key to 100 requests per `window`
+  max: EXTERNAL_API_RATE_LIMIT_MAX, // Limit each API key to this many requests per `window`
   standardHeaders: true, // Return rate limit info in the `RateLimit-*` headers
   legacyHeaders: false, // Disable the `X-RateLimit-*` headers
   keyGenerator: rateLimiterKeyGenerator,
 });
 
-router.get('/', validateUserAccessKey, (req, res, next) => {
+router.get('/', validateUserAccessKey, (req, res) => {
   res.json({
     version: 'v2',
     user: req.user?.toJSON(),
@@ -29,6 +33,13 @@ router.get('/', validateUserAccessKey, (req, res, next) => {
 router.use('/alerts', defaultRateLimiter, validateUserAccessKey, alertsRouter);
 
 router.use('/charts', defaultRateLimiter, validateUserAccessKey, chartsRouter);
+
+router.use(
+  '/connections',
+  defaultRateLimiter,
+  validateUserAccessKey,
+  connectionsRouter,
+);
 
 router.use(
   '/dashboards',
@@ -44,6 +55,13 @@ router.use(
   sourcesRouter,
 );
 
+router.use(
+  '/saved-searches',
+  defaultRateLimiter,
+  validateUserAccessKey,
+  savedSearchesRouter,
+);
+
 router.use('/search', defaultRateLimiter, validateUserAccessKey, searchRouter);
 
 router.use(
@@ -52,5 +70,7 @@ router.use(
   validateUserAccessKey,
   webhooksRouter,
 );
+
+router.use('/team', defaultRateLimiter, validateUserAccessKey, teamRouter);
 
 export default router;

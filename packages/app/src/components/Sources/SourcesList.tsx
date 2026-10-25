@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
+import { useRouter } from 'next/router';
+import { Badge } from '@clickhouse/click-ui';
 import { SourceKind } from '@hyperdx/common-utils/dist/types';
 import {
   ActionIcon,
   Alert,
-  Badge,
   Box,
   Button,
   Card,
@@ -19,6 +20,7 @@ import {
   IconAlertCircle,
   IconChevronDown,
   IconChevronUp,
+  IconFolder,
   IconPlus,
   IconRefresh,
   IconServer,
@@ -28,8 +30,8 @@ import {
 import { IS_LOCAL_MODE } from '@/config';
 import { useConnections } from '@/connection';
 import { useSources } from '@/source';
-import { capitalizeFirstLetter } from '@/utils';
 
+import { SOURCE_KIND_LABELS } from './SourceForm/constants';
 import { TableSourceForm } from './SourceForm';
 
 import styles from './Sources.module.scss';
@@ -73,8 +75,43 @@ export function SourcesList({
   const [editedSourceId, setEditedSourceId] = useState<string | null>(null);
   const [isCreatingSource, setIsCreatingSource] = useState(false);
 
+  // Expand and scroll to the relevant source when the URL includes a
+  // `#source-<id>` anchor.
+  const router = useRouter();
+  const expandedFromHashRef = useRef<string | null>(null);
   const isLoading = isLoadingConnections || isLoadingSources;
   const error = connectionsError || sourcesError;
+
+  useEffect(() => {
+    if (!router.isReady || isLoading || error) return;
+
+    const hash = window.location.hash;
+    const sourceId = hash?.startsWith('#source-')
+      ? hash.slice('#source-'.length)
+      : undefined;
+
+    if (!sourceId || expandedFromHashRef.current === sourceId) return;
+    if (!sources?.some(s => s.id === sourceId)) return;
+    expandedFromHashRef.current = sourceId;
+
+    // Expand the source
+    setEditedSourceId(sourceId);
+
+    // Scroll the source into view.
+    requestAnimationFrame(() => {
+      document
+        .getElementById(`source-${sourceId}`)
+        ?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    });
+
+    // Drop the hash (keeping the query, e.g. `?tab=`) so later commits
+    // don't re-trigger Next's scrollToHash.
+    void router.replace(
+      { pathname: router.pathname, query: router.query },
+      undefined,
+      { shallow: true },
+    );
+  }, [router, sources, isLoading, error]);
 
   const handleRetry = () => {
     refetchConnections();
@@ -156,7 +193,7 @@ export function SourcesList({
 
         {sources?.map((s, index) => (
           <React.Fragment key={s.id}>
-            <Flex justify="space-between" align="center">
+            <Flex justify="space-between" align="center" id={`source-${s.id}`}>
               <div
                 style={{
                   flex: 1,
@@ -169,14 +206,18 @@ export function SourcesList({
                     {s.name}
                   </Text>
                   {s.disabled && (
-                    <Badge size="xs" variant="light" color="gray">
-                      Disabled
-                    </Badge>
+                    <Badge size="sm" text="Disabled" state="neutral" />
                   )}
                 </Group>
                 <Text size={subtextSize} c="dimmed" mt={4}>
                   <Group gap="xs">
-                    {capitalizeFirstLetter(s.kind)}
+                    {SOURCE_KIND_LABELS[s.kind]}
+                    {s.section && (
+                      <Group gap={4}>
+                        <IconFolder size={iconSize} />
+                        {s.section}
+                      </Group>
+                    )}
                     <Group gap={4}>
                       <IconServer size={iconSize} />
                       {connections?.find(c => c.id === s.connection)?.name}

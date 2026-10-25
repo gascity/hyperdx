@@ -205,10 +205,13 @@ test.describe(
         const url = new URL(page.url());
         expect(url.searchParams.get('source')).toBe(logsSourceId);
         expect(url.searchParams.get('isLive')).toBe('false');
-        // Default row click encodes the group-by filter as a Lucene condition
-        // in the JSON-encoded `filters` param.
-        const filters = url.searchParams.get('filters') ?? '[]';
-        expect(filters).toContain(`ServiceName:\\"${serviceName}\\"`);
+        // Default row click encodes the group-by filter as a SQL IN clause in
+        // the JSON-encoded `filters` param. The search page reads it with nuqs
+        // (double-encoded), so decode the extra layer before asserting.
+        const filters = decodeURIComponent(
+          url.searchParams.get('filters') ?? '[]',
+        );
+        expect(filters).toContain(`ServiceName IN ('${serviceName}')`);
         const from = Number(url.searchParams.get('from'));
         const to = Number(url.searchParams.get('to'));
         expect(from).toBeGreaterThan(0);
@@ -563,8 +566,8 @@ test.describe(
         const filters = JSON.parse(decodeURIComponent(filtersRaw!));
         expect(filters).toEqual([
           {
-            type: 'lucene',
-            condition: `ServiceName:"${serviceName}"`,
+            type: 'sql',
+            condition: `ServiceName IN ('${serviceName}')`,
           },
         ]);
       });
@@ -649,8 +652,8 @@ test.describe(
         const filters = JSON.parse(decodeURIComponent(filtersRaw!));
         expect(filters).toEqual([
           {
-            type: 'lucene',
-            condition: `ServiceName:"${serviceName}"`,
+            type: 'sql',
+            condition: `ServiceName IN ('${serviceName}')`,
           },
         ]);
       });
@@ -667,6 +670,94 @@ test.describe(
 
       await test.step('Verify ignored-filters banner is hidden (filter was declared on target)', async () => {
         await expect(dashboardPage.ignoredUrlFiltersBanner).toBeHidden();
+      });
+    });
+
+    test('Dashboard mode: a variable-enabled target filter still receives an expression-keyed link', async ({
+      page,
+    }) => {
+      // `renderOnClickDashboard` has no view of the target's variable config, so
+      // links stay in the expression-keyed format. The target must still apply
+      // them — this is the back-compat read path through the real cross-page
+      // navigation.
+      const ts = Date.now();
+      const targetDashboardName = `E2E Variable Filter Target ${ts}`;
+      let targetDashboardId = '';
+
+      await test.step('Create the target dashboard with a variable-enabled ServiceName filter', async () => {
+        // beforeEach already created a dashboard; repurpose it as the target.
+        await dashboardPage.editDashboardName(targetDashboardName);
+        await dashboardPage.addTile();
+        await dashboardPage.chartEditor.createBasicChart(
+          `Variable Filter Target Tile ${ts}`,
+        );
+        targetDashboardId = dashboardPage.getCurrentDashboardId();
+        await dashboardPage.openEditFiltersModal();
+        await dashboardPage.addFilterToDashboard(
+          'Service Filter',
+          DEFAULT_LOGS_SOURCE_NAME,
+          'ServiceName',
+          undefined,
+          undefined,
+          { variableName: 'svc' },
+        );
+        await dashboardPage.closeFiltersModal();
+      });
+
+      await test.step('Create source dashboard with a Dashboard-mode filter template', async () => {
+        await dashboardPage.goto();
+        await dashboardPage.createNewDashboard();
+        await addTableTile(`E2E Variable Dashboard Filter ${ts}`);
+        await dashboardPage.chartEditor.openRowClickDrawer();
+        await dashboardPage.chartEditor.setRowClickMode('Dashboard');
+        await dashboardPage.chartEditor.selectRowClickTarget(
+          targetDashboardName,
+        );
+        await expect(
+          dashboardPage.chartEditor.onClickFilterExpressionInput(0),
+        ).toHaveValue('ServiceName');
+        await dashboardPage.chartEditor
+          .onClickFilterTemplateInput(0)
+          .fill('{{ServiceName}}');
+        await dashboardPage.chartEditor.applyRowClickDrawer();
+        await dashboardPage.saveTile();
+      });
+
+      await test.step('Set dashboard time range to Last 6 hours', async () => {
+        await dashboardPage.timePicker.selectRelativeTime('Last 6 hours');
+      });
+
+      await dashboardPage.waitForTableTileRows(0);
+      const serviceName = await dashboardPage.getFirstTableRowValue(0, 1);
+      expect(serviceName.length).toBeGreaterThan(0);
+
+      await test.step('Click first table row', async () => {
+        await dashboardPage.clickFirstTableRow(0);
+      });
+
+      await test.step('Verify the link is still expression-keyed', async () => {
+        await expect(page).toHaveURL(
+          new RegExp(`/dashboards/${targetDashboardId}`),
+          { timeout: 10000 },
+        );
+        const url = new URL(page.url());
+        const filtersRaw = url.searchParams.get('filters');
+        expect(filtersRaw).not.toBeNull();
+        const filters = JSON.parse(decodeURIComponent(filtersRaw!));
+        expect(filters).toEqual([
+          {
+            type: 'sql',
+            condition: `ServiceName IN ('${serviceName}')`,
+          },
+        ]);
+      });
+
+      await test.step('Verify the target applied it, with no banner', async () => {
+        await expect(
+          dashboardPage.getFilterPill('Service Filter', serviceName),
+        ).toBeVisible({ timeout: 20000 });
+        await expect(dashboardPage.ignoredUrlFiltersBanner).toBeHidden();
+        await expect(dashboardPage.getLinkErrorNotification()).toBeHidden();
       });
     });
 
@@ -749,6 +840,146 @@ test.describe(
           `${targetDashboardName} Renamed`,
         );
         await expect(dashboardPage.ignoredUrlFiltersBanner).toBeHidden();
+      });
+    });
+
+    test('External mode: row renders an absolute http(s) link opening in a new tab', async () => {
+      const ts = Date.now();
+
+      await test.step('Configure External-mode row click with a templated URL', async () => {
+        await addTableTile(`E2E External Link ${ts}`);
+        await dashboardPage.chartEditor.openRowClickDrawer();
+        await dashboardPage.chartEditor.setRowClickMode('External');
+        await dashboardPage.chartEditor.fillRowClickExternalUrl(
+          'https://grafana.example.com/d/abc?var-service={{ServiceName}}',
+        );
+        await dashboardPage.chartEditor.applyRowClickDrawer();
+        await dashboardPage.saveTile();
+      });
+
+      await test.step('Set dashboard time range to Last 6 hours', async () => {
+        await dashboardPage.timePicker.selectRelativeTime('Last 6 hours');
+      });
+
+      await dashboardPage.waitForTableTileRows(0);
+      // ServiceName is the second column in the rendered table (count is col 0).
+      const serviceName = await dashboardPage.getFirstTableRowValue(0, 1);
+      expect(serviceName.length).toBeGreaterThan(0);
+
+      await test.step('Verify the row renders a plain external anchor with the rendered URL', async () => {
+        const link = dashboardPage.getFirstRowActionLink(0);
+        await expect(link).toHaveAttribute('data-shape', 'external-link');
+        await expect(link).toHaveAttribute('target', '_blank');
+        await expect(link).toHaveAttribute('rel', 'noopener noreferrer');
+        await expect(link).toHaveAttribute(
+          'href',
+          `https://grafana.example.com/d/abc?var-service=${encodeURIComponent(
+            serviceName,
+          )}`,
+        );
+      });
+
+      await test.step('Verify no Link error notification appeared', async () => {
+        await expect(dashboardPage.getLinkErrorNotification()).toBeHidden();
+      });
+    });
+
+    test('External mode: a non-http(s) URL shows a Link error notification on click', async ({
+      page,
+    }) => {
+      const ts = Date.now();
+
+      await test.step('Configure External-mode row click with a relative URL', async () => {
+        await addTableTile(`E2E Bad External ${ts}`);
+        await dashboardPage.chartEditor.openRowClickDrawer();
+        await dashboardPage.chartEditor.setRowClickMode('External');
+        await dashboardPage.chartEditor.fillRowClickExternalUrl(
+          '/dashboards/{{ServiceName}}',
+        );
+        await dashboardPage.chartEditor.applyRowClickDrawer();
+        await dashboardPage.saveTile();
+      });
+
+      await test.step('Set dashboard time range to Last 6 hours', async () => {
+        await dashboardPage.timePicker.selectRelativeTime('Last 6 hours');
+      });
+
+      await dashboardPage.waitForTableTileRows(0);
+
+      await test.step('Click first row and verify Link error appears', async () => {
+        const dashboardUrlBefore = page.url();
+        await dashboardPage.clickFirstTableRow(0);
+        const notification = dashboardPage.getLinkErrorNotification();
+        await expect(notification).toBeVisible({ timeout: 5000 });
+        await expect(notification).toContainText(
+          /must be an absolute http\(s\) URL/,
+        );
+        // Should not have navigated away.
+        expect(page.url()).toBe(dashboardUrlBefore);
+      });
+    });
+
+    test('Trailing arrow hint appears on row hover and navigates to the action URL (HDX-4405)', async ({
+      page,
+    }) => {
+      // Pivot of the original HDX-4405 regression test: the row-click hint
+      // is now an anchored Mantine Tooltip wrapping a trailing arrow-up-right
+      // icon in the last cell, rather than a Tooltip.Floating that tracks the
+      // cursor. The arrow is hidden until the row is hovered and the
+      // tooltip is tied to the icon's lifecycle, so no stranded popup is
+      // possible by construction.
+      const ts = Date.now();
+
+      await test.step('Create a table tile with a Search row-click action', async () => {
+        await addTableTile(`E2E Tooltip ${ts}`);
+        await dashboardPage.chartEditor.openRowClickDrawer();
+        await dashboardPage.chartEditor.setRowClickMode('Search');
+        await dashboardPage.chartEditor.fillRowClickTemplate(
+          DEFAULT_LOGS_SOURCE_NAME,
+        );
+        await dashboardPage.chartEditor.applyRowClickDrawer();
+        await dashboardPage.saveTile();
+      });
+
+      await test.step('Set time range to Last 6 hours so rows render', async () => {
+        await dashboardPage.timePicker.selectRelativeTime('Last 6 hours');
+      });
+
+      await dashboardPage.waitForTableTileRows(0);
+
+      await test.step('Trailing arrow is hidden until the row is hovered', async () => {
+        const hint = dashboardPage.getRowActionHint(0);
+        // The icon is in the DOM but its visibility is gated by the
+        // .tableRow:hover .rowActionHint CSS opacity transition.
+        await expect(hint).toHaveCSS('opacity', '0');
+      });
+
+      await test.step('Hovering the row reveals the arrow and the tooltip describes the action', async () => {
+        const tooltip = await dashboardPage.hoverFirstTableRowAndGetTooltip(0);
+        await expect(tooltip).toContainText(/Search|Open/);
+      });
+
+      await test.step('Moving the cursor away closes the tooltip', async () => {
+        // Move to a neutral area; Mantine Tooltip closes on mouseleave
+        // (closeDelay=100ms in the component). Narrow the role match to
+        // the row-action tooltip text so the assertion does not flake on
+        // unrelated header / resize-handle tooltips that may also live in
+        // the portal at the moment of the check.
+        await page.mouse.move(10, 10);
+        await expect(
+          page.getByRole('tooltip', { name: /Search|Open/ }),
+        ).toBeHidden({ timeout: 3000 });
+      });
+
+      await test.step('Clicking the trailing arrow navigates to the same destination as the row body', async () => {
+        // Re-hover the row, then click the arrow. The Link inside the
+        // tooltip-wrapped arrow points to the same href as the per-cell
+        // links, so click navigates exactly as a row click would.
+        const row = dashboardPage.getFirstTableRow(0);
+        await row.hover();
+        const hint = dashboardPage.getRowActionHint(0);
+        await hint.click();
+        await expect(page).toHaveURL(/\/search\?/, { timeout: 10000 });
       });
     });
   },

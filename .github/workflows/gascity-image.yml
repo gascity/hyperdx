@@ -1,8 +1,9 @@
 # gascity fork CI — build + publish our patched HyperDX prod image (UI+API) to
 # ghcr.io/gascity, and GUARD that the proxy-auth patch is actually in the image
 # (a rebase that drops it must fail here, not ship stock upstream). See
-# GASCITY-FORK.md. Upstream's own workflows only run on `main`, so they don't
-# fire on gascity-sso.
+# GASCITY-FORK.md. The inherited upstream workflows are deleted on this branch
+# and disabled in the repo's Actions settings (schedule / issue_comment /
+# pull_request_target events read their workflow files from the default branch).
 name: gascity-image
 
 on:
@@ -10,9 +11,10 @@ on:
     branches: [gascity-sso]
   workflow_dispatch:
 
+# Read-only by default; only the publishing job gets packages: write (the
+# verify job runs dependency install scripts).
 permissions:
   contents: read
-  packages: write
 
 concurrency:
   group: gascity-image-${{ github.ref }}
@@ -27,6 +29,18 @@ jobs:
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Only fork-owned workflows on the build branch
+        # schedule / issue_comment / pull_request_target events read workflow
+        # files from the default branch (this one), so an inherited upstream
+        # workflow re-added by a rebase would run on the public fork.
+        run: |
+          extra=$(find .github/workflows -maxdepth 1 -type f ! -name 'gascity-*' | sort)
+          if [ -n "$extra" ]; then
+            echo "::error::inherited upstream workflows present; delete them in the rebase: $extra"
+            exit 1
+          fi
       - uses: actions/setup-node@v4
         with:
           node-version: 22
@@ -42,19 +56,25 @@ jobs:
         run: yarn workspace @hyperdx/api exec tsc --noEmit
       - name: Unit tests (proxy-auth + config regression)
         # Anchored regex passed positionally (= testPathPattern, version-agnostic;
-        # jest renamed the --testPathPattern flag) so we run ONLY the two DB-free
-        # unit suites; a bare "config" would also match renderChartConfig.test.ts,
-        # which needs CH/Mongo.
+        # jest renamed the --testPathPattern flag) so we run ONLY the DB-free
+        # fork suites plus upstream's config suite; a bare "config" would also
+        # match renderChartConfig.test.ts, which needs CH/Mongo.
         run: >-
-          DOTENV_CONFIG_PATH=.env.test
-          yarn workspace @hyperdx/api exec jest --runInBand --ci --forceExit
-          '(proxyHeaderAuth|__tests__/config)\.test\.ts$'
+          DOTENV_CONFIG_PATH=.env.test yarn workspace @hyperdx/api exec jest
+          --runInBand --ci --forceExit
+          '(proxyHeaderAuth|proxyAuth[A-Za-z]+|__tests__/config)\.test\.ts$'
 
   build:
     name: build prod image + symbol guard + push
+    needs: verify
     runs-on: blacksmith-2vcpu-ubuntu-2404
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v3
       - name: Login to ghcr
         uses: docker/login-action@v3
@@ -65,9 +85,15 @@ jobs:
       - name: Compute tags
         id: meta
         run: |
+          set -euo pipefail
           SHA=${GITHUB_SHA::12}
-          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
-          echo "code_version=2.28.0-gascity-$SHA" >> "$GITHUB_OUTPUT"
+          # The upstream release this branch is based on (bumped by the rebase).
+          VERSION=$(jq -r .version packages/app/package.json)
+          {
+            echo "sha=$SHA"
+            echo "version=$VERSION"
+            echo "code_version=$VERSION-gascity-$SHA"
+          } >> "$GITHUB_OUTPUT"
       - name: Build prod image (load locally for the guard)
         uses: docker/build-push-action@v6
         with:
@@ -87,22 +113,39 @@ jobs:
       - name: Symbol guard — the patch MUST be present in the built image
         run: |
           set -euo pipefail
-          for sym in IS_PROXY_AUTH_ENABLED proxyHeaderAuth PROXY_AUTH_SHARED_SECRET; do
-            if docker run --rm --entrypoint sh "${IMAGE}:ci-build" \
-                 -c "grep -rqF '$sym' /app/packages/api/build"; then
-              echo "ok: '$sym' present in /app/packages/api/build"
-            else
-              echo "::error::patch symbol '$sym' NOT found — refusing to publish a stock image"
-              exit 1
-            fi
-          done
+          docker run --rm --entrypoint sh "${IMAGE}:ci-build" -c '
+            set -eu
+            for spec in \
+              /app/packages/api/build/config.js:IS_PROXY_AUTH_ENABLED \
+              /app/packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET \
+              /app/packages/api/build/config.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+              /app/packages/api/build/config.js:HDX_NODE_ADVANCED_NETWORK_CAPTURE \
+              /app/packages/api/build/middleware/proxyHeaderAuth.js:timingSafeEqual \
+              /app/packages/api/build/middleware/proxyHeaderAuth.js:PROXY_AUTH_SHARED_SECRET_PREVIOUS \
+              /app/packages/api/build/middleware/proxyHeaderAuth.js:consumeProxyAuthSecret \
+              /app/packages/api/build/middleware/auth.js:establishProxyAuthSession \
+              /app/packages/api/build/api-app.js:consumeProxyAuthSecret \
+              /app/packages/api/build/routers/api/clickhouseProxy.js:removeHeader
+            do
+              file="${spec%%:*}"
+              symbol="${spec#*:}"
+              grep -qF "$symbol" "$file" || {
+                echo "patch symbol $symbol missing from $file" >&2
+                exit 1
+              }
+              echo "ok: $symbol present in $file"
+            done
+          ' || {
+            echo "::error::proxy-auth patch missing from production files — refusing to publish"
+            exit 1
+          }
       - name: Tag + push
         run: |
           set -euo pipefail
-          SHA="${{ steps.meta.outputs.sha }}"
+          TAG="${{ steps.meta.outputs.code_version }}"
           docker tag "${IMAGE}:ci-build" "${IMAGE}:gascity-sso"
-          docker tag "${IMAGE}:ci-build" "${IMAGE}:2.28.0-gascity-${SHA}"
+          docker tag "${IMAGE}:ci-build" "${IMAGE}:${TAG}"
           docker push "${IMAGE}:gascity-sso"
-          docker push "${IMAGE}:2.28.0-gascity-${SHA}"
+          docker push "${IMAGE}:${TAG}"
           echo "### published ###"
           docker inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "${IMAGE}:gascity-sso"

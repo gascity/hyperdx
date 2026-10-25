@@ -4,8 +4,10 @@ import objectHash from 'object-hash';
 import {
   ColumnMeta,
   ColumnMetaType,
+  convertCHDataTypeToJSType,
   extractColumnReferencesFromKey,
   filterColumnMetaByType,
+  isCHIntegerType,
   JSDataType,
 } from '@hyperdx/common-utils/dist/clickhouse';
 import { inferGranularityFromMVSelect } from '@hyperdx/common-utils/dist/core/materializedViews';
@@ -15,7 +17,10 @@ import { splitAndTrimWithBracket } from '@hyperdx/common-utils/dist/core/utils';
 import { isBuilderChartConfig } from '@hyperdx/common-utils/dist/guards';
 import {
   BuilderSavedChartConfig,
+  ChartConfig,
+  ChartConfigWithOptDateRange,
   ChartConfigWithOptTimestamp,
+  MetricFormula,
   MetricsDataType,
   NumberFormat,
   SourceKind,
@@ -48,7 +53,7 @@ export const SESSION_TABLE_EXPRESSIONS = {
   implicitColumnExpression: 'Body',
 } as const;
 
-export const JSON_SESSION_TABLE_EXPRESSIONS = {
+const JSON_SESSION_TABLE_EXPRESSIONS = {
   ...SESSION_TABLE_EXPRESSIONS,
   timestampValueExpression: 'Timestamp',
 } as const;
@@ -81,13 +86,37 @@ export function getDisplayedTimestampValueExpression(eventModel: TSource) {
 export function getEventBody(eventModel: TSource) {
   let expression: string | undefined;
   if (eventModel.kind === SourceKind.Trace) {
-    expression = eventModel.spanNameExpression ?? undefined;
+    expression = eventModel.spanNameExpression || undefined;
   } else if (eventModel.kind === SourceKind.Log) {
     expression =
-      eventModel.bodyExpression ?? eventModel.implicitColumnExpression;
+      eventModel.bodyExpression || eventModel.implicitColumnExpression;
   }
   const multiExpr = splitAndTrimWithBracket(expression ?? '');
   return multiExpr.length === 1 ? expression : multiExpr[0];
+}
+
+/**
+ * The source's level column: severity text for logs, status code for traces.
+ */
+export function getLevelExpression(source?: TSource): string {
+  if (source?.kind === SourceKind.Log) {
+    return source.severityTextExpression ?? '';
+  }
+  if (source?.kind === SourceKind.Trace) {
+    return source.statusCodeExpression ?? '';
+  }
+  return '';
+}
+
+/**
+ * Check if a select string is a single expression (valid as a pattern body
+ * expression) rather than a multi-column list (stale
+ * `defaultTableSelectExpression`). Uses bracket-aware comma splitting so
+ * expressions like `COALESCE(SpanName, Body)` are correctly treated as a
+ * single expression.
+ */
+export function isSingleExpression(select: string): boolean {
+  return splitAndTrimWithBracket(select).length <= 1;
 }
 
 // This function is for supporting legacy sources, which did not require this field.
@@ -178,6 +207,14 @@ export function useSource({
   });
 }
 
+// PromQL lookups are cached by source ID alone, so a source pointed at another
+// table would keep serving the old table's values until they go stale.
+const PROMQL_SOURCE_QUERY_KEYS = [
+  'promql-metric-names',
+  'promql-label-names',
+  'dashboard-filter-promql-label-values',
+];
+
 export function useUpdateSource() {
   const queryClient = useQueryClient();
 
@@ -192,8 +229,11 @@ export function useUpdateSource() {
         json: source,
       });
     },
-    onSuccess: () => {
+    onSuccess: (_data, { source }) => {
       queryClient.invalidateQueries({ queryKey: ['sources'] });
+      for (const key of PROMQL_SOURCE_QUERY_KEYS) {
+        queryClient.invalidateQueries({ queryKey: [key, source.id] });
+      }
     },
   });
 }
@@ -256,6 +296,17 @@ function hasAllColumns(columns: ColumnMeta[], requiredColumns: string[]) {
   );
 
   return missingColumns.length === 0;
+}
+
+// Metric tables need this optional column to join against the unified `series` table.
+const SERIES_HASH_COLUMN_NAME = 'SeriesHash';
+const SERIES_HASH_COLUMN_TYPE = 'UInt64';
+
+export function hasSeriesHashColumn(columns: ColumnMeta[]) {
+  return columns.some(
+    c =>
+      c.name === SERIES_HASH_COLUMN_NAME && c.type === SERIES_HASH_COLUMN_TYPE,
+  );
 }
 
 type TStrippedSource<T extends TSource> = Partial<
@@ -358,6 +409,21 @@ export async function inferTableSourceConfig({
   // Check if SpanEvents column is available
   const hasSpanEvents = columns.some(col => col.name === 'Events.Timestamp');
 
+  // Check if span Links column is available
+  const hasSpanLinks = columns.some(col => col.name === 'Links.TraceId');
+
+  // Old exporter tables store SeverityNumber as Int32, current ones as UInt8.
+  // A String column of that name is not the OTel number.
+  const hasSeverityNumber = columns.some(
+    col => col.name === 'SeverityNumber' && isCHIntegerType(col.type),
+  );
+
+  const hasEventName = columns.some(
+    col =>
+      col.name === 'EventName' &&
+      convertCHDataTypeToJSType(col.type) === JSDataType.String,
+  );
+
   // Check if metadata rollup tables exist and, if so, infer the bucketing
   // granularity from the key-rollup view's `as_select`
   const rollupMeta =
@@ -375,21 +441,18 @@ export async function inferTableSourceConfig({
               connectionId,
             }),
           ]);
-          return keyMeta != null && kvMeta != null
-            ? { keyMeta, kvMeta }
-            : undefined;
+          return kvMeta != null ? { keyMeta, kvMeta } : undefined;
         })()
       : undefined;
 
   const metadataMVsConfig = rollupMeta
     ? {
         metadataMaterializedViews: {
-          keyRollupTable: `${tableName}_key_rollup_15m`,
           kvRollupTable: `${tableName}_kv_rollup_15m`,
           // Fall back to '15 minute' to preserve the prior default when the
           // MV's `as_select` doesn't contain a recognized bucketing function.
           granularity:
-            inferGranularityFromMVSelect(rollupMeta.keyMeta.as_select) ??
+            inferGranularityFromMVSelect(rollupMeta.kvMeta.as_select) ??
             '15 minute',
         },
       }
@@ -412,6 +475,10 @@ export async function inferTableSourceConfig({
           traceIdExpression: 'TraceId',
 
           severityTextExpression: 'SeverityText',
+          ...(hasSeverityNumber
+            ? { severityNumberExpression: 'SeverityNumber' }
+            : {}),
+          ...(hasEventName ? { eventNameExpression: 'EventName' } : {}),
           ...metadataMVsConfig,
         }
       : {}),
@@ -435,10 +502,52 @@ export async function inferTableSourceConfig({
           statusCodeExpression: 'StatusCode',
           statusMessageExpression: 'StatusMessage',
           ...(hasSpanEvents ? { spanEventsValueExpression: 'Events' } : {}),
+          ...(hasSpanLinks ? { spanLinksValueExpression: 'Links' } : {}),
           ...metadataMVsConfig,
         }
       : {}),
   };
+}
+
+// The TimeSeries table the ClickHouse Prometheus docs tell users to create,
+// which is what ClickHouse Cloud PromQL preview services will likely have.
+// https://clickhouse.com/docs/concepts/features/interfaces/prometheus#create-a-timeseries-table
+const DOCS_TIME_SERIES_TABLE = {
+  databaseName: 'prometheus',
+  tableName: 'metrics',
+};
+
+// The TimeSeries table name used by the collector's PromQL schema migration
+// and the dev ClickHouse remote-write handler.
+const COLLECTOR_TIME_SERIES_TABLE_NAME = 'metrics_ts';
+
+// The time column of a TimeSeries table's data inner table, which every PromQL
+// source uses.
+export const PROMQL_TIMESTAMP_EXPRESSION = 'timestamp';
+
+/**
+ * Picks the TimeSeries table to back an auto-provisioned PromQL source. Prefers
+ * the docs' `prometheus.metrics`, then the collector's `metrics_ts` in
+ * `preferredDatabase` (the OTel tables' database), then `metrics_ts` anywhere.
+ * Without either name, a sole TimeSeries table is still picked.
+ */
+export function pickTimeSeriesTable(
+  tables: TPromqlSource['from'][],
+  preferredDatabase?: string,
+): TPromqlSource['from'] | undefined {
+  const collectorNamed = tables.filter(
+    t => t.tableName === COLLECTOR_TIME_SERIES_TABLE_NAME,
+  );
+  return (
+    tables.find(
+      t =>
+        t.databaseName === DOCS_TIME_SERIES_TABLE.databaseName &&
+        t.tableName === DOCS_TIME_SERIES_TABLE.tableName,
+    ) ??
+    collectorNamed.find(t => t.databaseName === preferredDatabase) ??
+    collectorNamed[0] ??
+    (tables.length === 1 ? tables[0] : undefined)
+  );
 }
 
 export function getDurationMsExpression(source: TTraceSource) {
@@ -544,6 +653,15 @@ export function useSingleSeriesNumberFormat(
   const { data: source } = useSource({ id: config.source });
 
   return useMemo(() => {
+    // Metric formula configs display the formula — number charts always
+    // hide the operand series (see convertToNumberChartConfig), so the
+    // first (only) value column is formulas[0], not select[0]. Resolve the
+    // format from the formula, not from an operand that isn't rendered.
+    const formulaConfig = getFormulaConfig(config);
+    if (formulaConfig) {
+      return formulaConfig.formulas[0]?.numberFormat ?? config.numberFormat;
+    }
+
     if (
       isBuilderChartConfig(config) &&
       Array.isArray(config.select) &&
@@ -572,6 +690,52 @@ interface ResolvedNumberFormats {
 }
 
 /**
+ * The formula projection settings of a builder config, or undefined when
+ * formulas don't apply (non-builder configs or no formulas configured).
+ * Source-kind agnostic: metric formulas render through the composed
+ * multi-series query and event (log/trace) formulas compile inline, but both
+ * project the same column shape (operands unless hidden, then formulas).
+ */
+function getFormulaConfig(
+  config: ChartConfig | ChartConfigWithOptDateRange,
+): { formulas: MetricFormula[]; operandsHidden: boolean } | undefined {
+  if (!isBuilderChartConfig(config) || !config.formulas?.length) {
+    return undefined;
+  }
+  return {
+    formulas: config.formulas,
+    operandsHidden: config.showOperandSeries === false,
+  };
+}
+
+/**
+ * How many value (series) columns a builder chart config's query result
+ * carries, ahead of any group-by passthrough columns.
+ *
+ * Mirrors the projection built by the query renderer
+ * (renderMultiSeriesMetricChartConfig / ratio merging in common-utils):
+ *  - metric formula configs project the operand series columns (unless
+ *    `showOperandSeries` is false) followed by one column per formula;
+ *  - ratio configs merge their two series into a single column;
+ *  - everything else projects one column per select entry.
+ */
+export function getBuilderValueColumnCount(
+  config: ChartConfig | ChartConfigWithOptDateRange,
+): number {
+  if (!isBuilderChartConfig(config) || !Array.isArray(config.select)) {
+    return 0;
+  }
+  const formulaConfig = getFormulaConfig(config);
+  if (formulaConfig) {
+    const operandCount = formulaConfig.operandsHidden
+      ? 0
+      : config.select.length;
+    return operandCount + formulaConfig.formulas.length;
+  }
+  return isRatioChartConfig(config.select, config) ? 1 : config.select.length;
+}
+
+/**
  * Returns the number formats to use when formatting chart series values.
  *
  * The chart-wide number format is determined with the following priorities:
@@ -595,15 +759,26 @@ export function useChartNumberFormats(
   const { data: source } = useSource({ id: config.source });
 
   return useMemo(() => {
+    const formulaConfig = getFormulaConfig(config);
+
     // The chart-wide number format does not depend on meta, so that it can be
     // resolved without querying. Further, it prioritizes the config's numberFormat
     // over series-specific formats, so that the user can specify the y-axis format
-    // for charts with multiple series-specific formats.
+    // for charts with multiple series-specific formats. When only formula
+    // columns render (operands hidden), formula formats take priority over
+    // formats of series that aren't in the result at all.
+    const firstFormulaFormat = formulaConfig?.formulas.find(
+      f => f.numberFormat,
+    )?.numberFormat;
+    const firstSeriesFormat =
+      isBuilderChartConfig(config) && Array.isArray(config.select)
+        ? getFirstSeriesNumberFormat(config.select, source)
+        : undefined;
     const chartFormat =
       config.numberFormat ??
-      (isBuilderChartConfig(config) && Array.isArray(config.select)
-        ? getFirstSeriesNumberFormat(config.select, source)
-        : undefined);
+      (formulaConfig?.operandsHidden
+        ? (firstFormulaFormat ?? firstSeriesFormat)
+        : (firstSeriesFormat ?? firstFormulaFormat));
 
     // meta must be provided to map result column names (from meta) to number formats
     if (!meta) {
@@ -613,6 +788,35 @@ export function useChartNumberFormats(
     // For Raw-SQL or string-based select configs, series-specific formats are not available
     if (!isBuilderChartConfig(config) || !Array.isArray(config.select)) {
       return { formatByColumn: new Map(), chartFormat };
+    }
+
+    // Metric formula configs project the operand series columns (unless
+    // hidden) followed by one column per formula, ahead of any group-by
+    // passthrough columns (see renderMultiSeriesMetricChartConfig). Map
+    // formats positionally in that order. Formulas supersede ratio, so this
+    // takes priority over the ratio branch below.
+    if (formulaConfig) {
+      const orderedFormats: (NumberFormat | undefined)[] = [
+        ...(formulaConfig.operandsHidden
+          ? []
+          : config.select.map(
+              series =>
+                series.numberFormat ??
+                config.numberFormat ??
+                getTraceDurationNumberFormat(source, series),
+            )),
+        ...formulaConfig.formulas.map(
+          formula => formula.numberFormat ?? config.numberFormat,
+        ),
+      ];
+      const formatByColumn = new Map<string, NumberFormat>();
+      orderedFormats.forEach((format, i) => {
+        const key = meta[i]?.name;
+        if (key != null && format) {
+          formatByColumn.set(key, format);
+        }
+      });
+      return { formatByColumn, chartFormat };
     }
 
     // Ratio-based configs have exactly two series, which
@@ -708,6 +912,17 @@ const ReqMetricTableColumns = {
     'MetricName',
     'ResourceAttributes',
   ],
+  // Unified metrics series table (not a MetricsDataType)
+  series: [
+    'Date',
+    'MetricName',
+    'SeriesHash',
+    'ServiceName',
+    'MetricType',
+    'Temporality',
+    'ResourceAttributes',
+    'Attributes',
+  ],
 };
 
 export async function isValidMetricTable({
@@ -720,7 +935,7 @@ export async function isValidMetricTable({
   databaseName: string;
   tableName?: string;
   connectionId: string;
-  metricType: MetricsDataType;
+  metricType: MetricsDataType | 'series';
   metadata: Metadata;
 }) {
   if (!tableName) {

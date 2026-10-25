@@ -1,4 +1,4 @@
-import { Application, Express } from 'express';
+import { Application } from 'express';
 import fs from 'fs';
 import path from 'path';
 import swaggerJsdoc from 'swagger-jsdoc';
@@ -31,6 +31,10 @@ export const swaggerOptions = {
       {
         name: 'Charts',
         description: 'Endpoints for querying chart data',
+      },
+      {
+        name: 'Connections',
+        description: 'Endpoints for managing ClickHouse connections',
       },
       {
         name: 'Sources',

@@ -10,9 +10,10 @@
 //   1. the gate MUST strip any client-supplied identity/secret headers on
 //      inbound and re-set them only after a successful SSO; and
 //   2. a NetworkPolicy MUST ensure only the gate can reach this port.
-// PROXY_AUTH_SHARED_SECRET is a strong in-app backstop (a value the browser
-// never sees, so it survives an edge header-strip misconfig). The email-domain
-// allowlist is defense-in-depth, never the primary control.
+// The current and optional previous proxy secrets are a strong in-app backstop
+// (values the browser never sees, so they survive an edge header-strip
+// misconfig). The email-domain allowlist is defense-in-depth, never the primary
+// control.
 import crypto from 'crypto';
 import type { NextFunction, Request, Response } from 'express';
 
@@ -22,10 +23,25 @@ import Team from '@/models/team';
 import User, { type UserDocument } from '@/models/user';
 import logger from '@/utils/logger';
 
+// RFC 5321 path limit; also bounds the work done on a header value.
+const MAX_EMAIL_LENGTH = 254;
+const WHITESPACE_OR_COMMA_RE = /[\s,]/;
+
 // Rejects obviously malformed values (a comma => a multi-valued header) before a
 // DB lookup. This is hygiene, NOT the security control -- the gate asserts the
-// authoritative, already-authenticated address.
-const EMAIL_RE = /^[^\s@,]+@[^\s@,]+\.[^\s@,]+$/;
+// authoritative, already-authenticated address. Accepts exactly one '@', a
+// non-empty local part, and a domain of two or more non-empty dot-separated
+// labels, with no whitespace or comma anywhere. Checked structurally rather
+// than with one backtracking regex, so a crafted header value costs linear time.
+function isWellFormedEmail(s: string): boolean {
+  if (s.length > MAX_EMAIL_LENGTH || WHITESPACE_OR_COMMA_RE.test(s)) {
+    return false;
+  }
+  const at = s.indexOf('@');
+  if (at <= 0 || s.includes('@', at + 1)) return false;
+  const labels = s.slice(at + 1).split('.');
+  return labels.length >= 2 && labels.every(label => label.length > 0);
+}
 
 // Control chars (\x00-\x1f, \x7f) aren't all matched by \s, and a ghost user
 // differing from a real one only by an invisible byte is a real vector. Checked
@@ -38,19 +54,59 @@ function hasControlChar(s: string): boolean {
   return false;
 }
 
+// The shared secret is injected by the gate on EVERY request, and two stock
+// HyperDX paths copy req.headers verbatim: the pino-http request log (written to
+// stdout and shipped to the log store) and the ClickHouse proxy (forwarded to
+// the connection's host, which any HyperDX user can point anywhere). So the
+// secret is taken off the request before any of that runs: consumeProxyAuthSecret
+// is mounted first in api-app.ts and parks the presented value here.
+const presentedSecrets = new WeakMap<Request, string>();
+
+export function consumeProxyAuthSecret(
+  req: Request,
+  _res: Response,
+  next: NextFunction,
+): void {
+  const name = config.PROXY_AUTH_SECRET_HEADER;
+  const value = req.get(name);
+  if (value !== undefined) {
+    presentedSecrets.set(req, value);
+    Reflect.deleteProperty(req.headers, name);
+    const scrubbed = req.rawHeaders.map((v, i, raw) =>
+      i % 2 === 1 && raw.at(i - 1)?.toLowerCase() === name ? '[REDACTED]' : v,
+    );
+    req.rawHeaders.splice(0, req.rawHeaders.length, ...scrubbed);
+  }
+  next();
+}
+
+function presentedSecret(req: Request): string {
+  return (
+    presentedSecrets.get(req) ?? req.get(config.PROXY_AUTH_SECRET_HEADER) ?? ''
+  );
+}
+
 function sharedSecretOk(req: Request): boolean {
-  const expected = config.PROXY_AUTH_SHARED_SECRET;
-  // No secret configured -> rely solely on the edge (header strip + netpol).
-  if (!expected) return true;
-  const got = req.get(config.PROXY_AUTH_SECRET_HEADER) ?? '';
+  const got = presentedSecret(req);
+  const currentMatches = secretEqual(got, config.PROXY_AUTH_SHARED_SECRET);
+  const previousMatches = secretEqual(
+    got,
+    config.PROXY_AUTH_SHARED_SECRET_PREVIOUS,
+  );
+  return currentMatches || previousMatches;
+}
+
+function secretEqual(got: string, expected: string): boolean {
+  if (!expected) return false;
   const a = Buffer.from(got);
   const b = Buffer.from(expected);
   // Length check first; timingSafeEqual throws on unequal lengths.
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
-// The gate-asserted email, iff proxy auth is enabled, the (optional) shared
-// secret matches, and the header carries exactly one well-formed address.
+// The gate-asserted email, iff proxy auth is enabled, a configured current or
+// previous secret matches, and the header carries exactly one well-formed
+// address.
 // Returns null otherwise, so the identity header is ignored and the caller
 // falls back to normal session / 401 handling. Returns null when proxy auth is
 // disabled, which keeps stock behavior byte-for-byte.
@@ -60,7 +116,7 @@ export function getProxyAuthEmail(req: Request): string | null {
   const raw = req.get(config.PROXY_AUTH_HEADER);
   if (!raw) return null;
   const email = raw.trim().toLowerCase();
-  if (!email || hasControlChar(email) || !EMAIL_RE.test(email)) return null;
+  if (!email || hasControlChar(email) || !isWellFormedEmail(email)) return null;
   return email;
 }
 
@@ -99,6 +155,50 @@ async function findOrCreateUser(
     }
     throw err;
   }
+}
+
+// True iff the gate vouched for this request (getProxyAuthEmail() non-null) AND
+// the current session already belongs to that same identity.
+export function hasProxyAuthSession(req: Request): boolean {
+  const email = getProxyAuthEmail(req);
+  return (
+    email !== null &&
+    req.isAuthenticated() &&
+    req.user?.email?.toLowerCase() === email
+  );
+}
+
+// Proxy mode with no matching session. Every request must carry a gate-vouched
+// identity: a bare session is never honored, so a stolen or long-lived cookie
+// cannot outlive the gate's session or an Authentik revocation (401). With a
+// vouched identity, (re)establish the session as that user, then hand control to
+// onEstablished (the caller's stock authenticated path). onEstablished only runs
+// once the session provably matches the gate identity, so re-entering the
+// caller cannot loop back here.
+export function establishProxyAuthSession(
+  req: Request,
+  res: Response,
+  next: NextFunction,
+  onEstablished: () => void,
+): void {
+  const email = getProxyAuthEmail(req);
+  if (!email) {
+    res.sendStatus(401);
+    return;
+  }
+  proxyHeaderAuth(
+    req,
+    res,
+    err => {
+      if (err) return next(err);
+      if (!hasProxyAuthSession(req)) {
+        res.sendStatus(401);
+        return;
+      }
+      onEstablished();
+    },
+    email,
+  ).catch(next);
 }
 
 // Establish a HyperDX session from the gate-asserted identity. Only called when

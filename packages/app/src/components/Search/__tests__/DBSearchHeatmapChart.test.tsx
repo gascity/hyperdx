@@ -6,8 +6,8 @@ import {
 } from '@hyperdx/common-utils/dist/types';
 import { screen } from '@testing-library/react';
 
-import type DBDeltaChartType from '../../DBDeltaChart';
-import { DBSearchHeatmapChart } from '../DBSearchHeatmapChart';
+import type DBDeltaChartType from '@/components/DBDeltaChart';
+import { DBSearchHeatmapChart } from '@/components/Search/DBSearchHeatmapChart';
 
 type FieldsState = {
   value: string;
@@ -63,7 +63,11 @@ jest.mock('../../DBHeatmapChart', () => ({
   ColorLegend: jest.fn(() => <div data-testid="color-legend">color scale</div>),
   darkPalette: ['#000'],
   lightPalette: ['#fff'],
-  toHeatmapChartConfig: jest.fn(() => ({ heatmapConfig: {} })),
+  toHeatmapQuery: jest.fn(() => ({
+    mode: 'distribution',
+    config: {},
+    scaleType: 'log',
+  })),
 }));
 
 // Capture props passed to DBDeltaChart so we can assert URL coords forward.

@@ -7,14 +7,20 @@ import {
   convertCHDataTypeToJSType,
   convertCHTypeToLuceneSearchType,
   extractInnerCHArrayJSType,
+  isCHFixedStringType,
   JSDataType,
 } from '@/clickhouse';
-import { supportsDirectReadMap } from '@/core/clickhouseVersion';
+import {
+  ClickHouseVersion,
+  isClickHouseVersionAtLeast,
+  supportsDirectReadMap,
+} from '@/core/clickhouseVersion';
 import {
   Metadata,
   parseKeyPath,
   SkipIndexMetadata,
   TableConnection,
+  unquoteIdentifier,
 } from '@/core/metadata';
 import {
   parseTokenizerFromTextIndex,
@@ -25,26 +31,82 @@ import { UseTextIndex } from '@/types';
 /** Max number of tokens to pass to hasAllTokens(), which supports up to 64 tokens as of ClickHouse v25.12. */
 const HAS_ALL_TOKENS_CHUNK_SIZE = 50;
 
-function encodeSpecialTokens(query: string): string {
-  return query
-    .replace(/\\\\/g, 'HDX_BACKSLASH_LITERAL')
-    .replace('http://', 'http_COLON_//')
-    .replace('https://', 'https_COLON_//')
-    .replace(/localhost:(\d{1,5})/, 'localhost_COLON_$1')
-    .replace(/\\:/g, 'HDX_COLON');
+/**
+ * Sequences the lucene grammar can't parse, placeholder-encoded before
+ * parsing. `source` restores the original query spelling; `value` is the
+ * raw value the sequence represents (lucene escaping dropped).
+ */
+const SPECIAL_TOKEN_ENCODINGS = [
+  {
+    encodePattern: /\\\\/g,
+    placeholder: 'HDX_BACKSLASH_LITERAL',
+    decodePattern: /HDX_BACKSLASH_LITERAL/g,
+    source: '\\\\',
+    value: '\\',
+  },
+  {
+    encodePattern: /http:\/\//g,
+    placeholder: 'http_COLON_//',
+    decodePattern: /http_COLON_\/\//g,
+    source: 'http://',
+    value: 'http://',
+  },
+  {
+    encodePattern: /https:\/\//g,
+    placeholder: 'https_COLON_//',
+    decodePattern: /https_COLON_\/\//g,
+    source: 'https://',
+    value: 'https://',
+  },
+  {
+    encodePattern: /localhost:(\d{1,5})/g,
+    placeholder: 'localhost_COLON_$1',
+    decodePattern: /localhost_COLON_(\d{1,5})/g,
+    source: 'localhost:$1',
+    value: 'localhost:$1',
+  },
+  {
+    encodePattern: /\\:/g,
+    placeholder: 'HDX_COLON',
+    decodePattern: /HDX_COLON/g,
+    source: '\\:',
+    value: ':',
+  },
+] as const;
+
+export function encodeSpecialTokens(query: string): string {
+  return SPECIAL_TOKEN_ENCODINGS.reduce(
+    (encoded, { encodePattern, placeholder }) =>
+      encoded.replace(encodePattern, placeholder),
+    query,
+  );
 }
-export function decodeSpecialTokens(query: string): string {
-  return query
-    .replace(/\\"/g, '"')
-    .replace(/HDX_BACKSLASH_LITERAL/g, '\\')
-    .replace('http_COLON_//', 'http://')
-    .replace('https_COLON_//', 'https://')
-    .replace(/localhost_COLON_(\d{1,5})/, 'localhost:$1')
-    .replace(/HDX_COLON/g, ':');
+
+/** Decode placeholders (and `\"`) to the raw values the sequences represent. */
+function decodeSpecialTokens(query: string): string {
+  return SPECIAL_TOKEN_ENCODINGS.reduce(
+    (decoded, { decodePattern, value }) =>
+      decoded.replace(decodePattern, value),
+    query.replace(/\\"/g, '"'),
+  );
+}
+
+/** Lossless inverse of `encodeSpecialTokens`: placeholders back to their original query spelling. */
+export function decodeSpecialTokensToSource(query: string): string {
+  return SPECIAL_TOKEN_ENCODINGS.reduce(
+    (decoded, { decodePattern, source }) =>
+      decoded.replace(decodePattern, source),
+    query,
+  );
 }
 
 export function parse(query: string): lucene.AST {
   return lucene.parse(encodeSpecialTokens(query));
+}
+
+/** Escape the LIKE/ILIKE metacharacters `\`, `%` and `_` so a term matches literally */
+function escapeLikePattern(term: string): string {
+  return term.replace(/[\\%_]/g, '\\$&');
 }
 
 function buildMapContains(mapField: string) {
@@ -53,29 +115,33 @@ function buildMapContains(mapField: string) {
   return SqlString.format('mapContains(??, ?)', [path[0], path[1]]);
 }
 
+/** Render a column as a SQL operand, escaping it as an identifier unless it is an already-rendered Map subscript */
+function renderColumnOperand(column: string | undefined, mapKey?: string) {
+  return SqlString.raw(
+    mapKey != null ? (column ?? '') : SqlString.escapeId(column),
+  );
+}
+
 /** Strip whitespace and backtick-quoting from a ClickHouse expression for comparison */
 function normalizeChExpression(expr: string): string {
   return expr.replace(/\s+/g, '').replace(/`/g, '');
 }
 
-const IMPLICIT_FIELD = '<implicit>';
+export const IMPLICIT_FIELD = '<implicit>';
+const RANGE_UNBOUNDED = '*';
 
 // Type guards for lucene AST types
-export function isNodeTerm(
-  node: lucene.Node | lucene.AST,
-): node is lucene.NodeTerm {
+function isNodeTerm(node: lucene.Node | lucene.AST): node is lucene.NodeTerm {
   return 'term' in node && node.term != null;
 }
 
-export function isNodeRangedTerm(
+function isNodeRangedTerm(
   node: lucene.Node | lucene.AST,
 ): node is lucene.NodeRangedTerm {
   return 'inclusive' in node && node.inclusive != null;
 }
 
-export function isBinaryAST(
-  ast: lucene.AST | lucene.Node,
-): ast is lucene.BinaryAST {
+function isBinaryAST(ast: lucene.AST | lucene.Node): ast is lucene.BinaryAST {
   return 'right' in ast && ast.right != null;
 }
 
@@ -85,7 +151,7 @@ function hasStart(
   return 'start' in ast && !!ast.start;
 }
 
-export function isLeftOnlyAST(
+function isLeftOnlyAST(
   ast: lucene.AST | lucene.Node,
 ): ast is lucene.LeftOnlyAST {
   return (
@@ -192,6 +258,7 @@ interface Serializer {
     end: string,
     isNegatedField: boolean,
     context: SerializerContext,
+    inclusive?: lucene.NodeRangedTerm['inclusive'],
   ): Promise<string>;
 }
 
@@ -391,10 +458,20 @@ class EnglishSerializer implements Serializer {
     start: string,
     end: string,
     isNegatedField: boolean,
+    context: SerializerContext,
+    inclusive: lucene.NodeRangedTerm['inclusive'] = 'both',
   ) {
+    const startBound =
+      inclusive === 'both' || inclusive === 'left'
+        ? start
+        : `${start} (exclusive)`;
+    const endBound =
+      inclusive === 'both' || inclusive === 'right'
+        ? end
+        : `${end} (exclusive)`;
     return `${field} ${
       isNegatedField ? 'is not' : 'is'
-    } between ${start} and ${end}`;
+    } between ${startBound} and ${endBound}`;
   }
 }
 
@@ -408,11 +485,17 @@ export abstract class SQLSerializer implements Serializer {
     column?: string;
     columnJSON?: { string: string; number: string };
     propertyType?: JSDataType;
+    /**
+     * The resolved column is FixedString. Token functions (hasToken,
+     * hasAllTokens) reject that haystack and need CAST(... AS String).
+     */
+    isFixedString?: boolean;
     isArray?: boolean;
     found: boolean;
+    mapKey?: string;
     mapKeyIndexExpression?: string;
     arrayMapKeyExpression?: string;
-    kvItemsExpression?: KvItemsInfo & { mapColumn: string; mapKey: string };
+    kvItemsExpression?: KvIndexInfo & { mapKey: string };
   }>;
 
   operator(op: lucene.Operator) {
@@ -449,6 +532,7 @@ export abstract class SQLSerializer implements Serializer {
       found,
       propertyType,
       isArray,
+      mapKey,
       mapKeyIndexExpression,
       arrayMapKeyExpression,
       kvItemsExpression,
@@ -474,7 +558,7 @@ export abstract class SQLSerializer implements Serializer {
     // so we emit: has(arr, 'key<sep>') OR NOT mapContains(Map, 'key')
     if (kvItemsExpression && propertyType === JSDataType.String) {
       const hasExpr = SqlString.format(`has(??, concat(?, ?, ?))`, [
-        kvItemsExpression.kvItemsColumn,
+        kvItemsExpression.columnName,
         kvItemsExpression.mapKey,
         kvItemsExpression.separator,
         term,
@@ -499,9 +583,9 @@ export abstract class SQLSerializer implements Serializer {
       // numeric and boolean fields must be equality matched
       const normTerm = `${term}`.trim().toLowerCase();
       return SqlString.format(
-        `(?? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+        `(? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
         [
-          column,
+          renderColumnOperand(column, mapKey),
           normTerm === 'true'
             ? 1
             : normTerm === 'false'
@@ -680,7 +764,7 @@ export abstract class SQLSerializer implements Serializer {
 
   // TODO: Not sure if SQL really needs this or if it'll coerce itself
   private attemptToParseNumber(term: string): string | number {
-    const number = Number.parseFloat(term);
+    const number = Number(term);
     if (Number.isNaN(number)) {
       return term;
     }
@@ -712,6 +796,7 @@ export abstract class SQLSerializer implements Serializer {
     end: string,
     isNegatedField: boolean,
     context: SerializerContext,
+    inclusive: lucene.NodeRangedTerm['inclusive'] = 'both',
   ) {
     const { column, found, mapKeyIndexExpression, isArray } =
       await this.getColumnForField(field, context);
@@ -727,10 +812,41 @@ export abstract class SQLSerializer implements Serializer {
       mapKeyIndexExpression && !isNegatedField
         ? ` AND ${mapKeyIndexExpression}`
         : '';
-    return SqlString.format(
-      `(${column} ${isNegatedField ? 'NOT ' : ''}BETWEEN ? AND ?${expressionPostfix})`,
-      [this.attemptToParseNumber(start), this.attemptToParseNumber(end)],
-    );
+
+    const isStartUnbounded = start === RANGE_UNBOUNDED;
+    const isEndUnbounded = end === RANGE_UNBOUNDED;
+    if (isStartUnbounded && isEndUnbounded) {
+      return this.isNotNull(field, isNegatedField, context);
+    }
+    if (!isStartUnbounded && !isEndUnbounded && inclusive === 'both') {
+      return SqlString.format(
+        `(${column} ${isNegatedField ? 'NOT ' : ''}BETWEEN ? AND ?${expressionPostfix})`,
+        [this.attemptToParseNumber(start), this.attemptToParseNumber(end)],
+      );
+    }
+
+    const bounds: string[] = [];
+    if (!isStartUnbounded) {
+      const operator =
+        inclusive === 'both' || inclusive === 'left' ? '>=' : '>';
+      bounds.push(
+        SqlString.format(`${column} ${operator} ?`, [
+          this.attemptToParseNumber(start),
+        ]),
+      );
+    }
+    if (!isEndUnbounded) {
+      const operator =
+        inclusive === 'both' || inclusive === 'right' ? '<=' : '<';
+      bounds.push(
+        SqlString.format(`${column} ${operator} ?`, [
+          this.attemptToParseNumber(end),
+        ]),
+      );
+    }
+    return isNegatedField
+      ? `(NOT (${bounds.join(' AND ')})${expressionPostfix})`
+      : `(${bounds.join(' AND ')}${expressionPostfix})`;
   }
 }
 
@@ -744,8 +860,9 @@ type CustomSchemaSQLColumnExpression = {
   };
   mapKeyIndexExpression?: string;
   arrayMapKeyExpression?: string;
+  mapKey?: string;
   /** When a KV items index exists for a Map column, carries the info needed for the has() optimization */
-  kvItemsExpression?: KvItemsInfo & { mapColumn: string; mapKey: string };
+  textIndexInfo?: TextIndexInfo;
 };
 
 export type CustomSchemaConfig = {
@@ -816,7 +933,7 @@ function renderArrayFieldExpression({
         ])
       : SqlString.format(`${prefix}arrayExists(el -> el[?] ILIKE ?, ?)`, [
           mapKey,
-          `%${term}%`,
+          `%${escapeLikePattern(term)}%`,
           SqlString.raw(column),
         ]);
   }
@@ -835,7 +952,7 @@ function renderArrayFieldExpression({
         ])
       : SqlString.format(
           `${prefix}arrayExists(el -> toString(el.??) ILIKE ?, ?)`,
-          [mapKey, `%${term}%`, SqlString.raw(column)],
+          [mapKey, `%${escapeLikePattern(term)}%`, SqlString.raw(column)],
         );
   }
 
@@ -853,18 +970,33 @@ function renderArrayFieldExpression({
         )
       : SqlString.format(
           `${prefix}arrayExists(el -> ${stringifiedElement} ILIKE ?, ?)`,
-          [`%${term}%`, SqlString.raw(column)],
+          [`%${escapeLikePattern(term)}%`, SqlString.raw(column)],
         );
 }
 
 /** Describes a KV items column and its concat separator */
-export type KvItemsInfo = {
-  kvItemsColumn: string;
+export type KvIndexInfo = {
+  columnName: string;
+  indexName: string;
   separator: string;
+  /**
+   * Whether the connected ClickHouse server supports `hasAny(items, array(...))`
+   * over the KV items column. `hasAny` on the direct_read map items column only
+   * ships in mainline 26.5+; earlier backport branches (26.2/26.3/26.4) support
+   * `has(...)` but not `hasAny(...)` and must fall back to a chain of `has()`
+   * calls combined with `OR`.
+   */
+  useHasAny: boolean;
+  mapColumn: string;
 };
+export type KeyIndexInfo = {
+  indexName: string;
+  mapColumn: string;
+};
+export type TextIndexInfo = { kv?: KvIndexInfo; key?: KeyIndexInfo };
 
-/** Map from map column name to its KV items info */
-export type KvItemsLookup = Map<string, KvItemsInfo>;
+/** Map from map column name to its text index info */
+export type TextIndexInfoLookup = Map<string, TextIndexInfo>;
 
 /**
  * Tokenizes a ClickHouse expression into meaningful tokens (identifiers, parens,
@@ -1079,6 +1211,179 @@ const KV_ITEMS_STRATEGIES = [
   parseKvItemsCastExpression,
 ] as const;
 
+export function skipIndexMatches(
+  idx: SkipIndexMetadata,
+  expectedType:
+    | 'text'
+    | 'bloom_filter'
+    | 'minmax'
+    | 'tokenbf_v1'
+    | 'set'
+    | 'ngrambf_v1',
+  options?: {
+    tokenizer?: string;
+  },
+): boolean {
+  if (idx.type !== expectedType) return false;
+  if (expectedType === 'text' && options?.tokenizer) {
+    // ClickHouse's system.data_skipping_indices.type_full can render the
+    // tokenizer as either `tokenizer=array` or `tokenizer='array'` depending on
+    // server version. Delegate to the shared parser, which strips quotes and
+    // handles whitespace, instead of matching a single literal shape.
+    const parsed = parseTokenizerFromTextIndex(idx);
+    if (parsed?.type !== options.tokenizer) return false;
+  }
+  return true;
+}
+
+function populateValidKvTextIndices(
+  serverVersion: ClickHouseVersion | undefined,
+  columns: ColumnMeta[],
+  skipIndices: SkipIndexMetadata[],
+  isCloud: boolean,
+  lookup: TextIndexInfoLookup,
+) {
+  const isDirectReadSupported = supportsDirectReadMap(serverVersion, isCloud);
+  const useHasAny = isClickHouseVersionAtLeast(serverVersion, [26, 5, 0, 0]);
+  const candidates = columns.filter(
+    c =>
+      ((isDirectReadSupported && c.default_type === 'ALIAS') ||
+        c.default_type === 'MATERIALIZED') &&
+      c.default_expression,
+  );
+  for (const candidate of candidates) {
+    let parsed: { mapColumn: string; separator: string } | undefined;
+    for (const strategy of KV_ITEMS_STRATEGIES) {
+      parsed = strategy(candidate.default_expression);
+      if (parsed) break;
+    }
+    if (!parsed) continue;
+
+    const candidateName = normalizeChExpression(candidate.name);
+    const candidateExpr = normalizeChExpression(candidate.default_expression);
+
+    const validIndex = skipIndices.find(idx => {
+      if (!skipIndexMatches(idx, 'text', { tokenizer: 'array' })) return false;
+      const tokenizer = parseTokenizerFromTextIndex(idx);
+      if (tokenizer?.type !== 'array') return false;
+      const idxExpr = normalizeChExpression(idx.expression);
+      return idxExpr === candidateName || idxExpr === candidateExpr;
+    });
+
+    if (validIndex) {
+      let entry = lookup.get(parsed.mapColumn);
+      if (!entry) {
+        entry = {};
+        lookup.set(parsed.mapColumn, entry);
+      }
+      entry.kv = {
+        columnName: candidate.name,
+        indexName: validIndex.name,
+        separator: parsed.separator,
+        useHasAny,
+        mapColumn: parsed.mapColumn,
+      };
+    }
+  }
+}
+
+function populateValidKeyTextIndices(
+  _serverVersion: ClickHouseVersion | undefined,
+  columns: ColumnMeta[],
+  skipIndices: SkipIndexMetadata[],
+  _isCloud: boolean,
+  lookup: TextIndexInfoLookup,
+) {
+  const mapKeyIndexStartString = 'mapKeys(';
+  const candidates = skipIndices.filter(
+    idx =>
+      idx.expression.startsWith(mapKeyIndexStartString) &&
+      skipIndexMatches(idx, 'text', { tokenizer: 'array' }),
+  );
+  for (const candidate of candidates) {
+    const parsedMapColumn = candidate.expression.slice(
+      mapKeyIndexStartString.length,
+      -1,
+    );
+
+    const validColumn = columns.find(
+      col =>
+        col.name === parsedMapColumn &&
+        col.type === 'Map(LowCardinality(String), String)',
+    );
+
+    if (validColumn) {
+      let entry = lookup.get(parsedMapColumn);
+      if (!entry) {
+        entry = {};
+        lookup.set(parsedMapColumn, entry);
+      }
+      entry.key = {
+        indexName: candidate.name,
+        mapColumn: validColumn.name,
+      };
+    }
+  }
+}
+
+/**
+ * Builds a lookup from map column name to KV items column name.
+ * A KV items column is an ALIAS/MATERIALIZED column whose expression is
+ * arrayMap((k,v)->concat(k,'=',v), mapKeys(X), mapValues(X)) and which has
+ * a text(tokenizer=array) skip index.
+ *
+ * The version gate (`supportsDirectReadMap`) only applies to ALIAS items
+ * columns: ALIAS columns are computed at query time, so `has(items, ...)`
+ * against an ALIAS only realizes its speedup when the server can perform a
+ * direct_read against the underlying Map's tuple storage. MATERIALIZED items
+ * columns are physically stored on disk, so `has()` reads them directly and
+ * is fast on any ClickHouse version that supports the text index itself.
+ *
+ * Returns an empty Map on any failure; never throws.
+ */
+export async function buildTextIndexInfoLookup({
+  metadata,
+  databaseName,
+  tableName,
+  connectionId,
+}: {
+  metadata: Metadata;
+  databaseName: string;
+  tableName: string;
+  connectionId: string;
+}): Promise<TextIndexInfoLookup> {
+  const lookup: TextIndexInfoLookup = new Map();
+  try {
+    const [serverVersion, columns, skipIndices, isCloud] = await Promise.all([
+      metadata.getServerVersion({ connectionId }),
+      metadata.getColumns({ databaseName, tableName, connectionId }),
+      metadata
+        .getSkipIndices({ databaseName, tableName, connectionId })
+        .catch(() => [] as SkipIndexMetadata[]),
+      metadata.isClickHouseCloud({ connectionId }).catch(() => false),
+    ]);
+
+    populateValidKvTextIndices(
+      serverVersion,
+      columns,
+      skipIndices,
+      isCloud,
+      lookup,
+    );
+    populateValidKeyTextIndices(
+      serverVersion,
+      columns,
+      skipIndices,
+      isCloud,
+      lookup,
+    );
+    return lookup;
+  } catch (error) {
+    console.warn('Error building KV items lookup:', error);
+  }
+  return lookup;
+}
+
 export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
   private metadata: Metadata;
   private tableName: string;
@@ -1089,7 +1394,7 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
   private useTextIndexForImplicitColumn: UseTextIndex;
   private skipIndicesPromise?: Promise<SkipIndexMetadata[]>;
   private enableTextIndexPromise?: Promise<boolean>;
-  private kvItemsLookupPromise?: Promise<KvItemsLookup>;
+  private textIndexInfoLookupPromise?: Promise<TextIndexInfoLookup>;
 
   constructor({
     metadata,
@@ -1134,81 +1439,16 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
         return false;
       });
 
-    // Pre-fetch KV items lookup (map column -> KV items column with text(tokenizer=array) index)
-    this.kvItemsLookupPromise = this.buildKvItemsLookup().catch(error => {
-      console.warn('Error building KV items lookup:', error);
-      return new Map();
-    });
+    this.textIndexInfoLookupPromise = this.buildTextIndexInfoLookup();
   }
 
-  /**
-   * Builds a lookup from map column name to KV items column name.
-   * A KV items column is an ALIAS/MATERIALIZED column whose expression is
-   * arrayMap((k,v)->concat(k,'=',v), mapKeys(X), mapValues(X)) and which has
-   * a text(tokenizer=array) skip index.
-   *
-   * The version gate (`supportsDirectReadMap`) only applies to ALIAS items
-   * columns: ALIAS columns are computed at query time, so `has(items, ...)`
-   * against an ALIAS only realizes its speedup when the server can perform a
-   * direct_read against the underlying Map's tuple storage. MATERIALIZED items
-   * columns are physically stored on disk, so `has()` reads them directly and
-   * is fast on any ClickHouse version that supports the text index itself.
-   */
-  private async buildKvItemsLookup(): Promise<KvItemsLookup> {
-    const [serverVersion, columns, skipIndices] = await Promise.all([
-      this.metadata.getServerVersion({ connectionId: this.connectionId }),
-      this.metadata.getColumns({
-        databaseName: this.databaseName,
-        tableName: this.tableName,
-        connectionId: this.connectionId,
-      }),
-      this.skipIndicesPromise ?? Promise.resolve([]),
-    ]);
-
-    const directReadSupported = supportsDirectReadMap(serverVersion);
-
-    const lookup: KvItemsLookup = new Map();
-
-    const kvItemsCandidates = columns.filter(
-      c =>
-        (c.default_type === 'ALIAS' || c.default_type === 'MATERIALIZED') &&
-        c.default_expression,
-    );
-
-    for (const candidate of kvItemsCandidates) {
-      if (candidate.default_type === 'ALIAS' && !directReadSupported) {
-        continue;
-      }
-
-      const parsed = (() => {
-        let parsed: { mapColumn: string; separator: string } | undefined;
-        for (const strategy of KV_ITEMS_STRATEGIES) {
-          parsed = strategy(candidate.default_expression);
-          if (parsed) break;
-        }
-        return parsed;
-      })();
-      if (!parsed) continue;
-
-      const candidateName = normalizeChExpression(candidate.name);
-      const candidateExpr = normalizeChExpression(candidate.default_expression);
-      const hasArrayTextIndex = skipIndices.some(idx => {
-        if (idx.type !== 'text') return false;
-        const tokenizer = parseTokenizerFromTextIndex(idx);
-        if (tokenizer?.type !== 'array') return false;
-        const idxExpr = normalizeChExpression(idx.expression);
-        return idxExpr === candidateName || idxExpr === candidateExpr;
-      });
-
-      if (hasArrayTextIndex) {
-        lookup.set(parsed.mapColumn, {
-          kvItemsColumn: candidate.name,
-          separator: parsed.separator,
-        });
-      }
-    }
-
-    return lookup;
+  private buildTextIndexInfoLookup(): Promise<TextIndexInfoLookup> {
+    return buildTextIndexInfoLookup({
+      metadata: this.metadata,
+      databaseName: this.databaseName,
+      tableName: this.tableName,
+      connectionId: this.connectionId,
+    });
   }
 
   /**
@@ -1230,12 +1470,21 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
       found,
       propertyType,
       isArray,
+      mapKey,
       mapKeyIndexExpression,
       arrayMapKeyExpression,
+      isFixedString,
     } = await this.getColumnForField(field, context);
     if (!found) {
       return this.NOT_FOUND_QUERY;
     }
+    // hasToken rejects FixedString; lower(FixedString) stays FixedString, so a
+    // bare search against TraceId (FixedString(32) in the OTel schema) errors.
+    // hasAllTokens accepts FixedString and is how a text index is used, so that
+    // path keeps the raw column. LIKE accepts FixedString too. Bloom-filter
+    // index expressions are used as stored.
+    const tokenHaystack =
+      isFixedString && column ? `CAST(${column} AS String)` : column;
     const expressionPostfix =
       mapKeyIndexExpression &&
       !isNegatedField &&
@@ -1257,9 +1506,9 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
     if (propertyType === JSDataType.Bool) {
       const normTerm = `${term}`.trim().toLowerCase();
       return SqlString.format(
-        `(?? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
+        `(? ${isNegatedField ? '!' : ''}= ?${expressionPostfix})`,
         [
-          column,
+          renderColumnOperand(column, mapKey),
           normTerm === 'true'
             ? 1
             : normTerm === 'false'
@@ -1269,13 +1518,13 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
       );
     } else if (propertyType === JSDataType.Number) {
       return SqlString.format(
-        `(?? ${isNegatedField ? '!' : ''}= CAST(?, 'Float64')${expressionPostfix})`,
-        [column, term],
+        `(? ${isNegatedField ? '!' : ''}= CAST(?, 'Float64')${expressionPostfix})`,
+        [renderColumnOperand(column, mapKey), term],
       );
     } else if (propertyType === JSDataType.JSON) {
       return SqlString.format(
         `(${columnJSON?.string} ${isNegatedField ? 'NOT ' : ''}ILIKE ?${expressionPostfix})`,
-        [`%${term}%`],
+        [`%${escapeLikePattern(term)}%`],
       );
     }
 
@@ -1297,7 +1546,9 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
           `(lower(?) ${isNegatedField ? 'NOT ' : ''}LIKE lower(?))`,
           [
             SqlString.raw(column),
-            `${prefixWildcard ? '%' : ''}${term}${suffixWildcard ? '%' : ''}`,
+            `${prefixWildcard ? '%' : ''}${escapeLikePattern(term)}${
+              suffixWildcard ? '%' : ''
+            }`,
           ],
         );
       } else if (shouldUseTokenBf) {
@@ -1338,6 +1589,8 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
 
           // When the text index is on lower(column), we must pass lower(column)
           // as the first argument and wrap the tokens in lower() to match.
+          // Do not CAST here: hasAllTokens accepts FixedString, and CAST would
+          // no longer match an index built on the column.
           const hasAllTokensColumn = textIndexHasLower
             ? `lower(${column})`
             : column;
@@ -1362,7 +1615,7 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
               ...hasAllTokensExpressions,
               SqlString.format(`(lower(?) LIKE lower(?))`, [
                 SqlString.raw(column),
-                `%${term}%`,
+                `%${escapeLikePattern(term)}%`,
               ]),
             ].join(' AND ')}${isNegatedField ? ')' : ''})`;
           } else {
@@ -1392,7 +1645,7 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
               // If there are token separators in the term, try to match the whole term as well
               SqlString.format(`(lower(?) LIKE lower(?))`, [
                 SqlString.raw(column),
-                `%${term}%`,
+                `%${escapeLikePattern(term)}%`,
               ]),
             ].join(' AND ')}${isNegatedField ? ')' : ''})`;
           } else {
@@ -1407,20 +1660,20 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
           return `(${isNegatedField ? 'NOT (' : ''}${[
             ...tokens.map(token =>
               SqlString.format(`hasToken(lower(?), lower(?))`, [
-                SqlString.raw(column),
+                SqlString.raw(tokenHaystack),
                 token,
               ]),
             ),
             // If there are symbols in the term, try to match the whole term as well
             SqlString.format(`(lower(?) LIKE lower(?))`, [
               SqlString.raw(column),
-              `%${term}%`,
+              `%${escapeLikePattern(term)}%`,
             ]),
           ].join(' AND ')}${isNegatedField ? ')' : ''})`;
         } else {
           return SqlString.format(
             `(${isNegatedField ? 'NOT ' : ''}hasToken(lower(?), lower(?)))`,
-            [SqlString.raw(column), term],
+            [SqlString.raw(tokenHaystack), term],
           );
         }
       }
@@ -1428,7 +1681,7 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
 
     return SqlString.format(
       `(${column} ${isNegatedField ? 'NOT ' : ''}? ?${expressionPostfix})`,
-      [SqlString.raw('ILIKE'), `%${term}%`],
+      [SqlString.raw('ILIKE'), `%${escapeLikePattern(term)}%`],
     );
   }
 
@@ -1511,8 +1764,8 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
         const valueType = prefixMatch.type.match(/,\s+(\w+)\)$/)?.[1];
 
         // Check if a KV items index exists for this map column
-        const kvItemsLookup = await this.kvItemsLookupPromise;
-        const kvItemsInfo = kvItemsLookup?.get(prefixMatch.name);
+        const textIndexInfoLookup = await this.textIndexInfoLookupPromise;
+        const textIndexInfo = textIndexInfoLookup?.get(prefixMatch.name);
 
         return {
           found: true,
@@ -1522,13 +1775,12 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
           ]),
           mapKeyIndexExpression: `indexHint(${buildMapContains(`${prefixMatch.name}['${fieldPostfix}']`)})`,
           columnType: valueType ?? 'Unknown',
-          ...(kvItemsInfo
+          mapKey: fieldPostfix,
+          ...(textIndexInfo
             ? {
-                kvItemsExpression: {
-                  kvItemsColumn: kvItemsInfo.kvItemsColumn,
-                  mapColumn: prefixMatch.name,
-                  mapKey: fieldPostfix,
-                  separator: kvItemsInfo.separator,
+                textIndexInfo: {
+                  kv: textIndexInfo.kv,
+                  key: textIndexInfo.key,
                 },
               }
             : {}),
@@ -1696,16 +1948,41 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
     return false;
   }
 
+  /**
+   * Whether a single implicit-column expression is a FixedString column.
+   * Only a bare identifier is looked up. A function wrapper such as
+   * lower(TraceId) is left as written: concatWithSeparator returns String,
+   * and guessing the result type of an arbitrary expression is out of scope.
+   * A failed lookup keeps the previous hasToken SQL.
+   */
+  private async columnExpressionIsFixedString(
+    expression: string,
+  ): Promise<boolean> {
+    const columnName = unquoteIdentifier(expression.trim());
+    if (!columnName || columnName.includes('(')) {
+      return false;
+    }
+    try {
+      const meta = await this.metadata.getColumn({
+        databaseName: this.databaseName,
+        tableName: this.tableName,
+        column: columnName,
+        connectionId: this.connectionId,
+      });
+      return meta != null && isCHFixedStringType(meta.type);
+    } catch (error) {
+      console.debug('Error resolving implicit column type', error);
+      return false;
+    }
+  }
+
   async getColumnForField(field: string, context: SerializerContext) {
-    // Two-stage fallback: implicit wins over body, and per-call context
-    // overrides win over the source defaults. The body fallback lets log
-    // sources that only set Body Expression still serve bare-text Lucene
-    // search; this is the symmetric counterpart to `getEventBody` in
-    // packages/app/src/source.ts.
+    // Fall back to bodyExpression for implicit column expression.
+    // values can be empty if previously configured then removed.
     const implicitColumnExpression =
-      context.implicitColumnExpression ??
-      this.implicitColumnExpression ??
-      context.bodyExpression ??
+      context.implicitColumnExpression ||
+      this.implicitColumnExpression ||
+      context.bodyExpression ||
       this.bodyExpression;
     if (field === IMPLICIT_FIELD && !implicitColumnExpression) {
       throw new Error(
@@ -1722,8 +1999,7 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
     // applied. Mirrors the original "source's implicit column has not been
     // overridden" intent.
     const isSourceImplicit =
-      context.implicitColumnExpression === undefined &&
-      context.bodyExpression === undefined;
+      !context.implicitColumnExpression && !context.bodyExpression;
     if (field === IMPLICIT_FIELD && isSourceImplicit) {
       // Sources can specify multi-column implicit columns, eg. Body and Message, in
       // which case we search the combined string `concatWithSeparator(';', Body, Message)`.
@@ -1736,6 +2012,11 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
             : fieldFinal,
         columnJSON: undefined,
         propertyType: JSDataType.String,
+        // concatWithSeparator returns String even when an input is FixedString.
+        isFixedString:
+          expressions.length === 1
+            ? await this.columnExpressionIsFixedString(expressions[0])
+            : false,
         found: true,
       };
     }
@@ -1752,11 +2033,15 @@ export class CustomSchemaSQLSerializerV2 extends SQLSerializer {
       propertyType: type ?? undefined,
       isArray,
       found: expression.found,
+      mapKey: expression.mapKey,
       mapKeyIndexExpression: expression.mapKeyIndexExpression,
       arrayMapKeyExpression: isArray
         ? expression.arrayMapKeyExpression
         : undefined,
-      kvItemsExpression: expression.kvItemsExpression,
+      kvItemsExpression:
+        expression.textIndexInfo?.kv && expression.mapKey
+          ? { ...expression.textIndexInfo.kv, mapKey: expression.mapKey }
+          : undefined,
     };
   }
 }
@@ -1766,14 +2051,9 @@ async function nodeTerm(
   serializer: Serializer,
   context: SerializerContext,
 ): Promise<string> {
-  const isImplicitField = node.field === IMPLICIT_FIELD;
-  const rawField = node.field[0] === '-' ? node.field.slice(1) : node.field;
-  // Decode special-token placeholders the emitter inserted in the field name
-  // (e.g. HDX_COLON for an escaped `:` in a Map sub-key). Leave the implicit
-  // field sentinel untouched so downstream comparisons against IMPLICIT_FIELD
-  // still match.
-  const field = isImplicitField ? rawField : decodeSpecialTokens(rawField);
+  const field = node.field[0] === '-' ? node.field.slice(1) : node.field;
   let isNegatedField = node.field[0] === '-';
+  const isImplicitField = node.field === IMPLICIT_FIELD;
 
   // NodeTerm
   if (isNodeTerm(node)) {
@@ -1857,6 +2137,7 @@ async function nodeTerm(
       rangedTerm.term_max,
       isNegatedField,
       context,
+      rangedTerm.inclusive,
     );
   }
 
@@ -1875,7 +2156,7 @@ function createSerializerContext(
 
     return {
       ...currentContext,
-      implicitColumnExpression: decodeSpecialTokens(fieldWithoutNegation),
+      implicitColumnExpression: fieldWithoutNegation,
       ...(isNegatedAndParenthesized(ast)
         ? { isNegatedAndParenthesized: true }
         : {}),
@@ -2016,7 +2297,7 @@ export async function genEnglishExplanation({
     const { tableName, databaseName, connectionId } = tableConnection;
     const parsedQ = parse(query);
 
-    if (parsedQ) {
+    if (parsedQ && tableName && databaseName && connectionId) {
       const serializer = new EnglishSerializer({
         metadata,
         tableName,

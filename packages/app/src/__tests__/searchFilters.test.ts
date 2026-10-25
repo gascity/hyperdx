@@ -1,20 +1,16 @@
 import { enableMapSet } from 'immer';
-import { ClickhouseClient } from '@hyperdx/common-utils/dist/clickhouse/node';
-import { getMetadata } from '@hyperdx/common-utils/dist/core/metadata';
 import { filtersToQuery } from '@hyperdx/common-utils/dist/filters';
-import {
-  CustomSchemaSQLSerializerV2,
-  SearchQueryBuilder,
-} from '@hyperdx/common-utils/dist/queryParser';
 import { act, renderHook } from '@testing-library/react';
 
 import {
   areFiltersEqual,
   parseQuery,
   useSearchPageFilterState,
-} from '../searchFilters';
+} from '@/searchFilters';
 
 enableMapSet();
+
+type ConditionFilter = { type: 'sql' | 'lucene'; condition: string };
 
 describe('searchFilters', () => {
   describe('parseQuery', () => {
@@ -476,6 +472,147 @@ describe('searchFilters', () => {
         },
       });
     });
+
+    // Dashboard filters can be defined by an arbitrary expression, not just a
+    // bare column. The parser must treat the whole expression as the key and
+    // ignore operators/keywords nested inside its parentheses.
+    describe('complex expression keys', () => {
+      const ifExpr = `if(SeverityText = 'error' or SeverityText = 'fatal', 'Errors', 'Non-errors')`;
+      const ifWithInExpr = `if(SeverityText IN ('error', 'fatal'), 'Errors', 'Non-errors')`;
+
+      it('keeps the whole expression as the key when it contains OR and = inside parens', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifExpr} IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('splits on the outer IN, not the IN nested inside the expression', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifWithInExpr} IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifWithInExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('parses multiple selected values on an expression key', () => {
+        const result = parseQuery([
+          {
+            type: 'sql',
+            condition: `${ifExpr} IN ('Errors', 'Non-errors')`,
+          },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors', 'Non-errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('parses NOT IN on an expression key without splitting on nested IN', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifWithInExpr} NOT IN ('Errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifWithInExpr]: {
+            included: new Set(),
+            excluded: new Set(['Errors']),
+          },
+        });
+      });
+
+      it('parses included and excluded selections on the same expression key', () => {
+        const result = parseQuery([
+          { type: 'sql', condition: `${ifExpr} IN ('Errors')` },
+          { type: 'sql', condition: `${ifExpr} NOT IN ('Non-errors')` },
+        ]);
+        expect(result.filters).toEqual({
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(['Non-errors']),
+          },
+        });
+      });
+
+      it('extracts an expression clause from an AND-joined compound condition', () => {
+        const result = parseQuery([
+          {
+            type: 'sql',
+            condition: `ServiceName IN ('api') AND ${ifExpr} IN ('Errors')`,
+          },
+        ]);
+        expect(result.filters).toEqual({
+          ServiceName: {
+            included: new Set(['api']),
+            excluded: new Set(),
+          },
+          [ifExpr]: {
+            included: new Set(['Errors']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('does not split on AND nested inside an expression key', () => {
+        const betweenExpr = `if(Duration BETWEEN 1 AND 2, 'fast', 'slow')`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${betweenExpr} IN ('fast')` },
+        ]);
+        expect(result.filters).toEqual({
+          [betweenExpr]: {
+            included: new Set(['fast']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('does not treat a BETWEEN nested inside an expression key as a range', () => {
+        const betweenExpr = `if(Duration BETWEEN 1 AND 2, 'fast', 'slow')`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${betweenExpr} NOT IN ('slow')` },
+        ]);
+        expect(result.filters).toEqual({
+          [betweenExpr]: {
+            included: new Set(),
+            excluded: new Set(['slow']),
+          },
+        });
+      });
+
+      it('handles a nested function expression key', () => {
+        const key = `toString(multiIf(Status >= 500, 'error', Status >= 400, 'warn', 'ok'))`;
+        const result = parseQuery([
+          { type: 'sql', condition: `${key} IN ('error', 'warn')` },
+        ]);
+        expect(result.filters).toEqual({
+          [key]: {
+            included: new Set(['error', 'warn']),
+            excluded: new Set(),
+          },
+        });
+      });
+
+      it('round-trips an expression key through filtersToQuery', () => {
+        const originalFilters = {
+          [ifExpr]: {
+            included: new Set<string | boolean>(['Errors']),
+            excluded: new Set<string | boolean>(['Non-errors']),
+          },
+        };
+        const query = filtersToQuery(originalFilters);
+        expect(parseQuery(query).filters).toEqual(originalFilters);
+      });
+    });
   });
 
   describe('areFiltersEqual', () => {
@@ -636,219 +773,191 @@ describe('searchFilters', () => {
     });
   });
 
-  describe('round-trip: Lucene filters', () => {
-    it('round-trips Map filter with single included value', () => {
-      const filters = {
-        "LogAttributes['service.name']": {
-          included: new Set<string | boolean>(['my-app']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      expect(query).toEqual([
-        {
-          type: 'lucene',
-          condition: 'LogAttributes.service.name:"my-app"',
-        },
-      ]);
-      // After round-trip, bracket-notation key becomes dot notation
-      const parsed = parseQuery(query);
-      expect(parsed.filters).toEqual({
-        'LogAttributes.service.name': {
-          included: new Set(['my-app']),
-          excluded: new Set(),
-        },
-      });
-    });
+  describe('round-trip: DateTime columns', () => {
+    const dateTimeColumns = new Map<string, string>([
+      ['Timestamp', 'DateTime64(9)'],
+      ['TimestampTime', 'DateTime'],
+    ]);
 
-    it('round-trips Map filter with multiple included values', () => {
-      const filters = {
-        "ResourceAttributes['env']": {
-          included: new Set<string | boolean>(['prod', 'staging']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters).toEqual({
-        'ResourceAttributes.env': {
-          included: new Set(['prod', 'staging']),
-          excluded: new Set(),
-        },
-      });
-    });
-
-    it('round-trips Map filter with excluded values', () => {
-      const filters = {
-        "LogAttributes['level']": {
+    it('round-trips an excluded DateTime value (no areFiltersEqual reset)', () => {
+      const originalFilters = {
+        Timestamp: {
           included: new Set<string | boolean>(),
-          excluded: new Set<string | boolean>(['debug', 'trace']),
+          excluded: new Set<string | boolean>([
+            '2026-06-16T15:35:16.731000000Z',
+          ]),
         },
       };
-      const query = filtersToQuery(filters);
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
       const parsed = parseQuery(query);
+
       expect(parsed.filters).toEqual({
-        'LogAttributes.level': {
+        Timestamp: {
           included: new Set(),
-          excluded: new Set(['debug', 'trace']),
+          excluded: new Set(['2026-06-16T15:35:16.731000000Z']),
         },
       });
     });
 
-    it('round-trips values containing double quotes', () => {
-      const filters = {
-        "LogAttributes['msg']": {
-          included: new Set<string | boolean>(['say "hello"']),
+    it('round-trips an included DateTime value with multiple entries', () => {
+      const originalFilters = {
+        Timestamp: {
+          included: new Set<string | boolean>(['2026-06-16', '2026-06-17']),
           excluded: new Set<string | boolean>(),
         },
       };
-      const query = filtersToQuery(filters);
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
       const parsed = parseQuery(query);
+
       expect(parsed.filters).toEqual({
-        'LogAttributes.msg': {
-          included: new Set(['say "hello"']),
+        Timestamp: {
+          included: new Set(['2026-06-16', '2026-06-17']),
           excluded: new Set(),
         },
       });
     });
 
-    it('round-trips values containing backslashes', () => {
-      const filters = {
-        "LogAttributes['path']": {
-          included: new Set<string | boolean>(['C:\\path\\to\\file']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters).toEqual({
-        'LogAttributes.path': {
-          included: new Set(['C:\\path\\to\\file']),
-          excluded: new Set(),
-        },
-      });
-    });
-
-    it('round-trips plain key filters', () => {
-      const filters = {
-        service: {
-          included: new Set<string | boolean>(['app']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters).toEqual({
-        service: {
-          included: new Set(['app']),
-          excluded: new Set(),
-        },
-      });
-    });
-
-    it('round-trips boolean filter values', () => {
-      const filters = {
-        isRootSpan: {
-          included: new Set<string | boolean>([true]),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters).toEqual({
-        isRootSpan: {
-          included: new Set([true]),
-          excluded: new Set(),
-        },
-      });
-      // Verify .has(true) works (boolean, not string)
-      expect(parsed.filters.isRootSpan.included.has(true)).toBe(true);
-      expect(parsed.filters.isRootSpan.included.has('true')).toBe(false);
-    });
-
-    it('round-trips empty string values', () => {
-      const filters = {
-        tag: {
-          included: new Set<string | boolean>(['']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters.tag.included).toEqual(new Set(['']));
-    });
-
-    it('round-trips values with Lucene reserved characters', () => {
-      const filters = {
-        query: {
-          included: new Set<string | boolean>(['(foo) AND [bar]']),
-          excluded: new Set<string | boolean>(),
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters.query.included).toEqual(
-        new Set(['(foo) AND [bar]']),
-      );
-    });
-
-    it('round-trips range filters through Lucene', () => {
-      const filters = {
-        duration: {
-          included: new Set<string | boolean>(),
-          excluded: new Set<string | boolean>(),
-          range: { min: 10, max: 500 },
-        },
-      };
-      const query = filtersToQuery(filters);
-      const parsed = parseQuery(query);
-      expect(parsed.filters.duration.range).toEqual({ min: 10, max: 500 });
-    });
-
-    it('merges mixed sql and lucene filters for the same key', () => {
-      const parsed = parseQuery([
-        { type: 'sql', condition: `service IN ('app')` },
-        { type: 'lucene', condition: 'service:"web"' },
-      ]);
-      expect(parsed.filters.service.included).toEqual(new Set(['app', 'web']));
-    });
-
-    it('parses existing lucene filter from URL/API', () => {
+    it('parseQuery unwraps the DateTime wrapper independently of the producer', () => {
       const parsed = parseQuery([
         {
-          type: 'lucene',
+          type: 'sql',
           condition:
-            'LogAttributes.service:"app-1" OR LogAttributes.service:"app-2"',
+            "Timestamp NOT IN (parseDateTime64BestEffort('a', 9), parseDateTime64BestEffort('b', 9))",
         },
       ]);
+
       expect(parsed.filters).toEqual({
-        'LogAttributes.service': {
-          included: new Set(['app-1', 'app-2']),
+        Timestamp: {
+          included: new Set(),
+          excluded: new Set(['a', 'b']),
+        },
+      });
+    });
+
+    it('unwraps the DateTime part of a compound AND condition', () => {
+      const parsed = parseQuery([
+        {
+          type: 'sql',
+          condition:
+            "ServiceName IN ('api') AND Timestamp NOT IN (parseDateTime64BestEffort('2026-06-16', 9))",
+        },
+      ]);
+
+      expect(parsed.filters).toEqual({
+        ServiceName: {
+          included: new Set(['api']),
+          excluded: new Set(),
+        },
+        Timestamp: {
+          included: new Set(),
+          excluded: new Set(['2026-06-16']),
+        },
+      });
+    });
+
+    it('round-trips a DateTime value containing the wrapper suffix', () => {
+      const originalFilters = {
+        Timestamp: {
+          included: new Set<string | boolean>(["a', 9)b"]),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      const parsed = parseQuery(query);
+
+      expect(parsed.filters).toEqual({
+        Timestamp: {
+          included: new Set(["a', 9)b"]),
           excluded: new Set(),
         },
       });
     });
 
-    it('preserves unparseable Lucene filters as passthrough', () => {
-      const warnSpy = jest.spyOn(console, 'warn').mockImplementation(() => {});
-      const parsed = parseQuery([
-        { type: 'lucene', condition: '((((' },
-        { type: 'lucene', condition: 'service:"app"' },
-      ]);
-      // Valid filter is parsed
-      expect(parsed.filters.service.included).toEqual(new Set(['app']));
-      // Invalid filter is preserved in passthroughFilters
-      expect(parsed.passthroughFilters).toEqual([
-        { type: 'lucene', condition: '((((' },
-      ]);
-      warnSpy.mockRestore();
+    it('round-trips a plain DateTime column (parseDateTimeBestEffort wrapper)', () => {
+      const originalFilters = {
+        TimestampTime: {
+          included: new Set<string | boolean>(['2026-06-17T11:56:41Z']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, { dateTimeColumns });
+      // Sanity: produces the DateTime (non-64) wrapper.
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "TimestampTime IN (parseDateTimeBestEffort('2026-06-17T11:56:41Z'))",
+      );
+
+      expect(parseQuery(query).filters).toEqual({
+        TimestampTime: {
+          included: new Set(['2026-06-17T11:56:41Z']),
+          excluded: new Set(),
+        },
+      });
     });
 
-    it('returns empty array for valid but non-quoted Lucene (no passthrough)', () => {
-      const parsed = parseQuery([{ type: 'lucene', condition: 'service:foo' }]);
-      // Unquoted term — valid Lucene but not a filter, nothing extracted
-      expect(Object.keys(parsed.filters)).toHaveLength(0);
-      expect(parsed.passthroughFilters).toHaveLength(0);
+    it('parseQuery unwraps parseDateTimeBestEffort and toDate wrappers', () => {
+      const parsed = parseQuery([
+        {
+          type: 'sql',
+          condition: "TimestampTime IN (parseDateTimeBestEffort('a'))",
+        },
+        { type: 'sql', condition: "day NOT IN (toDate('2026-06-17'))" },
+      ]);
+
+      expect(parsed.filters).toEqual({
+        TimestampTime: { included: new Set(['a']), excluded: new Set() },
+        day: { included: new Set(), excluded: new Set(['2026-06-17']) },
+      });
+    });
+
+    // The map key can be a query-result column name that isn't a table column:
+    // an alias (`TimestampTime AS time`) or a computed expression
+    // (`toDate(TimestampTime)`). These only become filterable correctly when the
+    // type map is sourced from the result set rather than the table schema.
+    it('wraps and round-trips an aliased DateTime column', () => {
+      const aliasColumns = new Map<string, string>([['time', 'DateTime64(9)']]);
+      const originalFilters = {
+        time: {
+          included: new Set<string | boolean>(['2026-06-18T10:33:55Z']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, {
+        dateTimeColumns: aliasColumns,
+      });
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "time IN (parseDateTime64BestEffort('2026-06-18T10:33:55Z', 9))",
+      );
+
+      expect(parseQuery(query).filters).toEqual({
+        time: {
+          included: new Set(['2026-06-18T10:33:55Z']),
+          excluded: new Set(),
+        },
+      });
+    });
+
+    it('wraps a computed DateTime expression with the type-matched function', () => {
+      const exprColumns = new Map<string, string>([
+        ['toDate(TimestampTime)', 'Date'],
+      ]);
+      const originalFilters = {
+        'toDate(TimestampTime)': {
+          included: new Set<string | boolean>(['2026-06-18']),
+          excluded: new Set<string | boolean>(),
+        },
+      };
+
+      const query = filtersToQuery(originalFilters, {
+        dateTimeColumns: exprColumns,
+      });
+      expect((query[0] as ConditionFilter).condition).toBe(
+        "toDate(TimestampTime) IN (toDate('2026-06-18'))",
+      );
     });
   });
 
@@ -860,6 +969,7 @@ describe('searchFilters', () => {
         useSearchPageFilterState({
           searchQuery: [],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -869,21 +979,71 @@ describe('searchFilters', () => {
       });
 
       expect(onFilterChange).toHaveBeenLastCalledWith([
-        { type: 'lucene', condition: 'service:"app"' },
-        { type: 'lucene', condition: 'level:"error"' },
+        {
+          type: 'sql',
+          condition: "service IN ('app')",
+        },
+        {
+          type: 'sql',
+          condition: "level IN ('error')",
+        },
       ]);
     });
 
-    it('updating filter query from legacy sql input', () => {
+    it('setOnlyFilters applies all filters in a single onFilterChange emit', () => {
+      onFilterChange.mockClear();
       const { result } = renderHook(() =>
         useSearchPageFilterState({
-          // Legacy sql filters are still parsed correctly
+          searchQuery: [],
+          onFilterChange,
+          knownColumns: new Set(),
+        }),
+      );
+
+      act(() => {
+        result.current.setOnlyFilters([
+          { property: 'service', value: 'app' },
+          { property: 'level', value: 'error' },
+        ]);
+      });
+
+      // Batched: a single re-query, not one per property.
+      expect(onFilterChange).toHaveBeenCalledTimes(1);
+      expect(onFilterChange).toHaveBeenLastCalledWith([
+        { type: 'sql', condition: "service IN ('app')" },
+        { type: 'sql', condition: "level IN ('error')" },
+      ]);
+    });
+
+    it('setOnlyFilters replaces any existing values for the given property', () => {
+      onFilterChange.mockClear();
+      const { result } = renderHook(() =>
+        useSearchPageFilterState({
+          searchQuery: [{ type: 'sql', condition: `level IN ('info', 'ok')` }],
+          onFilterChange,
+          knownColumns: new Set(),
+        }),
+      );
+
+      act(() => {
+        result.current.setOnlyFilters([{ property: 'level', value: 'error' }]);
+      });
+
+      expect(onFilterChange).toHaveBeenLastCalledWith([
+        { type: 'sql', condition: "level IN ('error')" },
+      ]);
+    });
+
+    it('updating filter query', () => {
+      const { result } = renderHook(() =>
+        useSearchPageFilterState({
           searchQuery: [
             { type: 'sql', condition: `service IN ('hdx-oss-dev-app')` },
             { type: 'sql', condition: `hyperdx_event_type IN ('span')` },
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -892,14 +1052,10 @@ describe('searchFilters', () => {
         result.current.setFilterValue('another_facet', 'some_value');
       });
 
-      // Output is now lucene after round-trip
       expect(onFilterChange).toHaveBeenLastCalledWith([
-        { type: 'lucene', condition: 'hyperdx_event_type:"span"' },
-        {
-          type: 'lucene',
-          condition: '(level:"info" OR level:"ok")',
-        },
-        { type: 'lucene', condition: 'another_facet:"some_value"' },
+        { type: 'sql', condition: `hyperdx_event_type IN ('span')` },
+        { type: 'sql', condition: `level IN ('info', 'ok')` },
+        { type: 'sql', condition: `another_facet IN ('some_value')` },
       ]);
     });
 
@@ -912,6 +1068,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -920,12 +1077,12 @@ describe('searchFilters', () => {
       });
 
       expect(onFilterChange).toHaveBeenLastCalledWith([
-        { type: 'lucene', condition: 'service:"hdx-oss-dev-app"' },
-        { type: 'lucene', condition: 'hyperdx_event_type:"span"' },
+        { type: 'sql', condition: `service IN ('hdx-oss-dev-app')` },
+        { type: 'sql', condition: `hyperdx_event_type IN ('span')` },
       ]);
     });
 
-    it('correctly hydrates filter state from sql query', () => {
+    it('correctly hydrates filter state from query', () => {
       const { result } = renderHook(() =>
         useSearchPageFilterState({
           searchQuery: [
@@ -934,6 +1091,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level IN ('info', 'ok')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -958,6 +1116,7 @@ describe('searchFilters', () => {
             { type: 'sql', condition: `level NOT IN ('error')` },
           ],
           onFilterChange,
+          knownColumns: new Set(),
         }),
       );
 
@@ -966,41 +1125,9 @@ describe('searchFilters', () => {
       });
 
       expect(onFilterChange).toHaveBeenCalledWith([
-        { type: 'lucene', condition: 'service:"app"' },
-        { type: 'lucene', condition: 'level:"info"' },
+        { type: 'sql', condition: `service IN ('app')` },
+        { type: 'sql', condition: `level IN ('info')` }, // Should only have the included value, no excluded values
       ]);
-    });
-
-    it('migrates legacy SQL filters to Lucene on load', () => {
-      const onFilterChangeMigrate = jest.fn();
-      renderHook(() =>
-        useSearchPageFilterState({
-          searchQuery: [
-            { type: 'sql', condition: `service IN ('app')` },
-            { type: 'sql', condition: `level IN ('info', 'ok')` },
-          ],
-          onFilterChange: onFilterChangeMigrate,
-        }),
-      );
-
-      // Migration fires on mount, converting SQL to Lucene
-      expect(onFilterChangeMigrate).toHaveBeenCalledWith([
-        { type: 'lucene', condition: 'service:"app"' },
-        { type: 'lucene', condition: '(level:"info" OR level:"ok")' },
-      ]);
-    });
-
-    it('does not migrate when filters are already Lucene', () => {
-      const onFilterChangeNoMigrate = jest.fn();
-      renderHook(() =>
-        useSearchPageFilterState({
-          searchQuery: [{ type: 'lucene', condition: 'service:"app"' }],
-          onFilterChange: onFilterChangeNoMigrate,
-        }),
-      );
-
-      // No migration needed — onFilterChange should not be called
-      expect(onFilterChangeNoMigrate).not.toHaveBeenCalled();
     });
 
     describe('retainFiltersByColumns', () => {
@@ -1010,6 +1137,7 @@ describe('searchFilters', () => {
           useSearchPageFilterState({
             searchQuery: [],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -1033,6 +1161,7 @@ describe('searchFilters', () => {
               { type: 'lucene', condition: 'SeverityText:"error"' },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -1059,6 +1188,7 @@ describe('searchFilters', () => {
               },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -1078,10 +1208,11 @@ describe('searchFilters', () => {
         const { result } = renderHook(() =>
           useSearchPageFilterState({
             searchQuery: [
-              { type: 'lucene', condition: 'OldColumn:"x"' },
-              { type: 'lucene', condition: 'AnotherGone:"y"' },
+              { type: 'sql', condition: `OldColumn IN ('x')` },
+              { type: 'sql', condition: `AnotherGone IN ('y')` },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -1101,10 +1232,11 @@ describe('searchFilters', () => {
         const { result } = renderHook(() =>
           useSearchPageFilterState({
             searchQuery: [
-              { type: 'lucene', condition: 'ServiceName:"app"' },
-              { type: 'lucene', condition: 'Body:"oops"' },
+              { type: 'sql', condition: `ServiceName IN ('app')` },
+              { type: 'sql', condition: `Body IN ('oops')` },
             ],
             onFilterChange: onFilterChangeLocal,
+            knownColumns: new Set(),
           }),
         );
 
@@ -1117,157 +1249,9 @@ describe('searchFilters', () => {
 
         expect(dropped).toEqual(['Body']);
         expect(onFilterChangeLocal).toHaveBeenLastCalledWith([
-          { type: 'lucene', condition: 'ServiceName:"app"' },
+          { type: 'sql', condition: `ServiceName IN ('app')` },
         ]);
       });
-
-      it('preserves passthrough filters when reconciling', () => {
-        const onFilterChangeLocal = jest.fn();
-        const warnSpy = jest
-          .spyOn(console, 'warn')
-          .mockImplementation(() => {});
-        // Unparseable Lucene (mismatched parens) is preserved by parseQuery
-        // as a passthrough filter.
-        const { result } = renderHook(() =>
-          useSearchPageFilterState({
-            searchQuery: [
-              { type: 'lucene', condition: 'ServiceName:"app"' },
-              { type: 'lucene', condition: 'Body:"oops"' },
-              { type: 'lucene', condition: '((((' },
-            ],
-            onFilterChange: onFilterChangeLocal,
-          }),
-        );
-
-        let dropped: string[] = [];
-        act(() => {
-          dropped = result.current.retainFiltersByColumns(
-            new Set(['ServiceName']),
-          );
-        });
-
-        expect(dropped).toEqual(['Body']);
-        // Passthrough filter rides along after the kept filters.
-        expect(onFilterChangeLocal).toHaveBeenLastCalledWith([
-          { type: 'lucene', condition: 'ServiceName:"app"' },
-          { type: 'lucene', condition: '((((' },
-        ]);
-        warnSpy.mockRestore();
-      });
-    });
-  });
-
-  describe('filters use direct_read optimization', () => {
-    const metadata = getMetadata(
-      new ClickhouseClient({ host: 'http://localhost:8123' }),
-    );
-
-    metadata.getColumn = jest.fn().mockImplementation(async ({ column }) => {
-      if (column === 'LogAttributes') {
-        return { name: 'LogAttributes', type: 'Map(String, String)' };
-      }
-      return undefined;
-    });
-    metadata.getMaterializedColumnsLookupTable = jest
-      .fn()
-      .mockResolvedValue(new Map());
-    metadata.getColumns = jest.fn().mockResolvedValue([
-      {
-        name: 'LogAttributes',
-        type: 'Map(String, String)',
-        default_type: '',
-        default_expression: '',
-      },
-      {
-        name: 'LogAttributeItems',
-        type: 'Array(String)',
-        default_type: 'ALIAS',
-        default_expression:
-          "arrayMap((arr) -> concat(arr.1, '=', arr.2), LogAttributes::Array(Tuple(String, String)))",
-      },
-    ]);
-    metadata.getSkipIndices = jest.fn().mockResolvedValue([
-      {
-        name: 'idx_log_attr_items',
-        type: 'text',
-        typeFull: 'text(tokenizer=array)',
-        expression: 'LogAttributeItems',
-        granularity: 1,
-      },
-    ]);
-    metadata.getSetting = jest.fn().mockResolvedValue('0');
-    metadata.getServerVersion = jest
-      .fn()
-      .mockResolvedValue([26, 5, 0, 0] as const);
-
-    const serializer = new CustomSchemaSQLSerializerV2({
-      metadata,
-      databaseName: 'default',
-      tableName: 'otel_logs',
-      connectionId: 'test',
-    });
-
-    it('single included filter value uses has() direct_read', async () => {
-      const filters = filtersToQuery({
-        "LogAttributes['service.name']": {
-          included: new Set<string | boolean>(['my-app']),
-          excluded: new Set<string | boolean>(),
-        },
-      });
-
-      const condition = filters[0];
-      expect(condition.type).toBe('lucene');
-      const builder = new SearchQueryBuilder(
-        (condition as { condition: string }).condition,
-        serializer,
-      );
-      const sql = await builder.build();
-      expect(sql).toContain(
-        "has(`LogAttributeItems`, concat('service.name', '=', 'my-app'))",
-      );
-    });
-
-    it('multiple included filter values each use has() direct_read', async () => {
-      const filters = filtersToQuery({
-        "LogAttributes['env']": {
-          included: new Set<string | boolean>(['prod', 'staging']),
-          excluded: new Set<string | boolean>(),
-        },
-      });
-
-      const condition = filters[0];
-      expect(condition.type).toBe('lucene');
-      const builder = new SearchQueryBuilder(
-        (condition as { condition: string }).condition,
-        serializer,
-      );
-      const sql = await builder.build();
-      expect(sql).toContain(
-        "has(`LogAttributeItems`, concat('env', '=', 'prod'))",
-      );
-      expect(sql).toContain(
-        "has(`LogAttributeItems`, concat('env', '=', 'staging'))",
-      );
-    });
-
-    it('excluded filter value uses NOT has() direct_read', async () => {
-      const filters = filtersToQuery({
-        "LogAttributes['level']": {
-          included: new Set<string | boolean>(),
-          excluded: new Set<string | boolean>(['debug']),
-        },
-      });
-
-      const condition = filters[0];
-      expect(condition.type).toBe('lucene');
-      const builder = new SearchQueryBuilder(
-        (condition as { condition: string }).condition,
-        serializer,
-      );
-      const sql = await builder.build();
-      expect(sql).toContain(
-        "NOT has(`LogAttributeItems`, concat('level', '=', 'debug'))",
-      );
     });
   });
 });

@@ -12,14 +12,17 @@
 import React from 'react';
 import { renderHook } from '@testing-library/react';
 
-import { DEFAULT_THEME, themes } from '../index';
+import { DEFAULT_THEME, themes } from '@/theme/index';
 import {
   AppThemeProvider,
   useAppTheme,
   useLogomark,
+  usePageTitle,
   useThemeName,
   useWordmark,
-} from '../ThemeProvider';
+} from '@/theme/ThemeProvider';
+
+jest.mock('@/config', () => ({ INSTANCE_TITLE_SUFFIX: ' UK' }));
 
 // Mock localStorage
 let localStorageMock: jest.Mocked<Storage>;
@@ -141,6 +144,24 @@ describe('ThemeProvider', () => {
 
       expect(result.current).toBeDefined();
       expect(typeof result.current).toBe('object');
+    });
+  });
+
+  describe('usePageTitle', () => {
+    const wrapper = ({ children }: { children: React.ReactNode }) => (
+      <AppThemeProvider>{children}</AppThemeProvider>
+    );
+
+    it('appends the brand name and instance suffix with no page name', () => {
+      const { result } = renderHook(() => usePageTitle(), { wrapper });
+
+      expect(result.current).toBe('HyperDX UK');
+    });
+
+    it('prepends the page name when given one', () => {
+      const { result } = renderHook(() => usePageTitle('Search'), { wrapper });
+
+      expect(result.current).toBe('Search - HyperDX UK');
     });
   });
 

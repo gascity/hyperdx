@@ -1,20 +1,47 @@
 import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ActionIcon, Flex, FlexProps, Text, Tooltip } from '@mantine/core';
-import { IconX } from '@tabler/icons-react';
+import type { BuilderChartConfigWithDateRange } from '@hyperdx/common-utils/dist/types';
+import { Flex, FlexProps, Text } from '@mantine/core';
 
+import { FilterPill, FilterValueEditor } from '@/components/FilterPill';
+import { useGetKeyValues } from '@/hooks/useMetadata';
 import type { FilterStateHook } from '@/searchFilters';
+import { useFormatTime } from '@/useFormatTime';
 
 const MAX_VISIBLE_PILLS = 8;
+// Cap the value list fetched for the in-pill value picker.
+const VALUE_EDIT_LIMIT = 50;
+
+// Stable identity so a caller that omits the prop doesn't invalidate the
+// flattenFilters useMemo on every render.
+const EMPTY_DATE_TIME_COLUMNS: ReadonlyMap<string, string> = new Map();
+
+type FormatTime = ReturnType<typeof useFormatTime>;
 
 type PillItem = {
   field: string;
   value: string;
   type: 'included' | 'excluded' | 'range';
   rawValue?: string | boolean;
+  // Display-only label for the pill (e.g. a DateTime value formatted to the
+  // user's locale/timezone). The raw `value`/`rawValue` are kept intact for
+  // SQL generation, value editing, copy, and the URL round-trip.
+  displayValue?: string;
 };
 
-function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
+function flattenFilters(
+  filters: FilterStateHook['filters'],
+  {
+    dateTimeColumns,
+    formatTime,
+  }: { dateTimeColumns: ReadonlyMap<string, string>; formatTime: FormatTime },
+): PillItem[] {
   const pills: PillItem[] = [];
+
+  const formatDisplayValue = (field: string, val: string | boolean) =>
+    dateTimeColumns.has(field) && typeof val === 'string'
+      ? formatTime(val, { format: 'withMs' })
+      : undefined;
+
   for (const [field, state] of Object.entries(filters)) {
     for (const val of state.included) {
       pills.push({
@@ -22,6 +49,7 @@ function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
         value: String(val),
         type: 'included',
         rawValue: val,
+        displayValue: formatDisplayValue(field, val),
       });
     }
     for (const val of state.excluded) {
@@ -30,6 +58,7 @@ function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
         value: String(val),
         type: 'excluded',
         rawValue: val,
+        displayValue: formatDisplayValue(field, val),
       });
     }
     if (state.range != null) {
@@ -43,109 +72,78 @@ function flattenFilters(filters: FilterStateHook['filters']): PillItem[] {
   return pills;
 }
 
-const pillStyle = {
-  display: 'inline-flex',
-  alignItems: 'center',
-  gap: 4,
-  padding: '1px 6px',
-  borderRadius: 3,
-  fontSize: 11,
-  lineHeight: '18px',
-  cursor: 'default',
-  whiteSpace: 'nowrap' as const,
-  maxWidth: 260,
-  overflow: 'hidden',
-};
-
-function FilterPill({
+function SearchFilterPill({
   pill,
   isInvalid,
   invalidReason,
+  chartConfig,
   onRemove,
+  onTogglePolarity,
+  onReplaceValue,
 }: {
   pill: PillItem;
   isInvalid?: boolean;
   invalidReason?: string;
+  chartConfig: BuilderChartConfigWithDateRange;
   onRemove: () => void;
+  onTogglePolarity: () => void;
+  onReplaceValue: (value: string) => void;
 }) {
   const isExcluded = pill.type === 'excluded';
-  const operator = isExcluded ? ' != ' : pill.type === 'range' ? ': ' : ' = ';
+  // A range pill has no single value to copy or flip, and an unapplied filter
+  // (column missing on the active source) can only be removed.
+  const isEditable = pill.type !== 'range' && !isInvalid;
+  const [opened, setOpened] = useState(false);
 
-  const tooltipLabel = isInvalid
-    ? (invalidReason ??
-      `Filter not applied: "${pill.field}" isn't a column on the current source. It will reapply if you switch back.`)
-    : `${pill.field}${operator}${pill.value}`;
+  // The picker lists values to switch this pill to, so it must not be scoped
+  // by the active query or by the pill's own filter. Reusing chartConfig
+  // verbatim only ever returns values already matching the current filters, so
+  // an included pill would list just its own value. Clear where + filters to
+  // list all of the field's values in range, like the sidebar facet list's
+  // default "Show All Values" behavior.
+  const valueChartConfig = useMemo(
+    () => ({ ...chartConfig, where: '', filters: [] }),
+    [chartConfig],
+  );
 
-  const showDangerAccent = isExcluded && !isInvalid;
+  const { data: keyValues, isFetching: isFetchingValues } = useGetKeyValues(
+    {
+      chartConfig: valueChartConfig,
+      keys: [pill.field],
+      limit: VALUE_EDIT_LIMIT,
+    },
+    { enabled: opened && isEditable },
+  );
+  const valueOptions = useMemo(() => keyValues?.[0]?.value ?? [], [keyValues]);
 
   return (
-    <Tooltip label={tooltipLabel} openDelay={300} multiline maw={280}>
-      <span
-        data-testid={`active-filter-pill-${pill.field}`}
-        data-invalid={isInvalid ? 'true' : undefined}
-        style={{
-          ...pillStyle,
-          backgroundColor: isInvalid
-            ? 'transparent'
-            : isExcluded
-              ? 'var(--color-bg-danger)'
-              : 'var(--color-bg-hover)',
-          border: isInvalid
-            ? '1px dashed var(--color-border-emphasis)'
-            : '1px solid transparent',
-          opacity: isInvalid ? 0.75 : 1,
-        }}
-      >
-        <Text
-          span
-          size="xxs"
-          c="dimmed"
-          fw={500}
-          style={{
-            flexShrink: 0,
-            maxWidth: 100,
-            textDecoration: isInvalid ? 'line-through' : undefined,
-          }}
-          truncate="start"
-        >
-          {pill.field}
-        </Text>
-        <Text
-          span
-          size="xxs"
-          c="dimmed"
-          style={{
-            color: showDangerAccent ? 'var(--color-text-danger)' : undefined,
-            textDecoration: isInvalid ? 'line-through' : undefined,
-          }}
-        >
-          {operator}
-        </Text>
-        <Text
-          span
-          size="xxs"
-          fw={500}
-          truncate
-          style={{ textDecoration: isInvalid ? 'line-through' : undefined }}
-        >
-          {pill.value}
-        </Text>
-        <ActionIcon
-          size={14}
-          variant="transparent"
-          color="gray"
-          onClick={onRemove}
-          style={{
-            flexShrink: 0,
-            marginLeft: 2,
-            color: showDangerAccent ? 'var(--color-text-danger)' : undefined,
-          }}
-          aria-label="Remove filter"
-        >
-          <IconX size={9} />
-        </ActionIcon>
-      </span>
-    </Tooltip>
+    <FilterPill
+      field={pill.field}
+      operator={isExcluded ? '!=' : pill.type === 'range' ? ':' : '='}
+      value={pill.value}
+      displayValue={pill.displayValue}
+      isExcluded={isExcluded}
+      isInvalid={isInvalid}
+      invalidReason={invalidReason}
+      onRemove={onRemove}
+      onOpenedChange={setOpened}
+      renderPopover={
+        isEditable
+          ? close => (
+              <FilterValueEditor
+                value={pill.value}
+                valueOptions={valueOptions}
+                isLoadingValues={isFetchingValues}
+                isExcluded={isExcluded}
+                onReplaceValue={onReplaceValue}
+                onTogglePolarity={onTogglePolarity}
+                onDone={close}
+              />
+            )
+          : undefined
+      }
+      data-testid={`active-filter-pill-${pill.field}`}
+    />
   );
 }
 
@@ -153,9 +151,17 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
   searchFilters,
   invalidFields,
   invalidFieldReason,
+  chartConfig,
+  dateTimeColumns = EMPTY_DATE_TIME_COLUMNS,
   ...flexProps
 }: {
   searchFilters: FilterStateHook;
+  /**
+   * Map of DateTime/Date column name → ClickHouse type. Their pill values are
+   * formatted to the user's locale/timezone for display, matching the results
+   * table, while the underlying raw value is preserved for SQL/editing/copy.
+   */
+  dateTimeColumns?: ReadonlyMap<string, string>;
   /**
    * Field names whose filters are present in state but not applied to the
    * current query (e.g. column doesn't exist on the active source). These
@@ -168,11 +174,25 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
    * returns the tooltip text.
    */
   invalidFieldReason?: (field: string) => string;
+  /**
+   * Chart config for the active source. Passed to useGetKeyValues so the
+   * in-pill value picker can list the field's values.
+   */
+  chartConfig: BuilderChartConfigWithDateRange;
 } & FlexProps) {
-  const { filters, setFilterValue, clearFilter, clearAllFilters } =
-    searchFilters;
+  const {
+    filters,
+    setFilterValue,
+    replaceFilterValue,
+    clearFilter,
+    clearAllFilters,
+  } = searchFilters;
 
-  const pills = useMemo(() => flattenFilters(filters), [filters]);
+  const formatTime = useFormatTime();
+  const pills = useMemo(
+    () => flattenFilters(filters, { dateTimeColumns, formatTime }),
+    [filters, dateTimeColumns, formatTime],
+  );
   const [expanded, setExpanded] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
   const confirmTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
@@ -194,6 +214,40 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
       }
     },
     [setFilterValue, clearFilter],
+  );
+
+  // Flip a value between included and excluded in place. setFilterValue's
+  // 'include'/'exclude' actions already move the value across the two sets, so
+  // an excluded pill goes to included and vice versa without a remove + re-add.
+  const handleTogglePolarity = useCallback(
+    (pill: PillItem) => {
+      if (pill.rawValue == null) {
+        return;
+      }
+      setFilterValue(
+        pill.field,
+        pill.rawValue,
+        pill.type === 'excluded' ? 'include' : 'exclude',
+      );
+    },
+    [setFilterValue],
+  );
+
+  // Swap a pill's value for another value of the same field, preserving the
+  // pill's polarity. One atomic update (no remove + re-add double query run).
+  const handleReplaceValue = useCallback(
+    (pill: PillItem, newValue: string) => {
+      if (pill.rawValue == null) {
+        return;
+      }
+      replaceFilterValue(
+        pill.field,
+        pill.rawValue,
+        newValue,
+        pill.type === 'excluded' ? 'exclude' : 'include',
+      );
+    },
+    [replaceFilterValue],
   );
 
   const handleClearAll = useCallback(() => {
@@ -220,14 +274,17 @@ export const ActiveFilterPills = memo(function ActiveFilterPills({
       {visiblePills.map((pill, i) => {
         const isInvalid = invalidFields?.has(pill.field) ?? false;
         return (
-          <FilterPill
+          <SearchFilterPill
             key={`${pill.field}-${pill.type}-${pill.value}-${i}`}
             pill={pill}
             isInvalid={isInvalid}
             invalidReason={
               isInvalid ? invalidFieldReason?.(pill.field) : undefined
             }
+            chartConfig={chartConfig}
             onRemove={() => handleRemove(pill)}
+            onTogglePolarity={() => handleTogglePolarity(pill)}
+            onReplaceValue={value => handleReplaceValue(pill, value)}
           />
         );
       })}

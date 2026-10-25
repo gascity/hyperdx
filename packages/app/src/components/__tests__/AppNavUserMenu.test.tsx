@@ -1,13 +1,16 @@
 import React from 'react';
 import { screen } from '@testing-library/react';
 
-import { AppNavContext, AppNavUserMenu } from '../AppNav/AppNav.components';
+import {
+  AppNavContext,
+  AppNavUserMenu,
+} from '@/components/AppNav/AppNav.components';
 
 const renderAppNavUserMenu = (userName?: string) => {
   return renderWithMantine(
-    <AppNavContext.Provider value={{ isCollapsed: false, pathname: '/' }}>
+    <AppNavContext value={{ isCollapsed: false, pathname: '/' }}>
       <AppNavUserMenu userName={userName} teamName="HyperDX" />
-    </AppNavContext.Provider>,
+    </AppNavContext>,
   );
 };
 

@@ -5,18 +5,38 @@ import type {
   WebhookTestApiResponse,
   WebhookUpdateApiResponse,
 } from '@hyperdx/common-utils/dist/types';
+import { AlertThresholdType } from '@hyperdx/common-utils/dist/types';
 import express from 'express';
 import { ObjectId } from 'mongodb';
 import mongoose from 'mongoose';
+import ms from 'ms';
 import { z } from 'zod';
 import { validateRequest } from 'zod-express-middleware';
 
-import { AlertState } from '@/models/alert';
+import { createWebhook, deleteWebhook } from '@/controllers/webhook';
+import { AlertSource, AlertState } from '@/models/alert';
 import Webhook, { WebhookService } from '@/models/webhook';
+import {
+  ALERT_STATUS_BY_STATE,
+  ALERT_TYPE_BY_SOURCE,
+  COMPARATOR_BY_THRESHOLD_TYPE,
+} from '@/tasks/checkAlerts/template';
 import {
   handleSendGenericWebhook,
   handleSendSlackWebhook,
-} from '@/tasks/checkAlerts/template';
+} from '@/tasks/checkAlerts/transports';
+import type { Message } from '@/tasks/checkAlerts/transports/types';
+import { isDuplicateKeyError } from '@/utils/errors';
+import {
+  isWebhookValidationError,
+  validateWebhookConfig,
+} from '@/utils/validators';
+import {
+  webhookHeaderNameSchema,
+  webhookHeaderValueSchema,
+  webhookQueryParamKeySchema,
+  webhookQueryParamValueSchema,
+} from '@/utils/zod';
 
 const router = express.Router();
 
@@ -66,7 +86,7 @@ const toWebhookPlain = (doc: mongoose.Document): WebhookPlain =>
   doc.toJSON({ flattenMaps: true }) as WebhookPlain;
 
 const serializeWebhook = (doc: mongoose.Document): WebhookApiData => {
-  const { team, __v, ...data } = doc.toJSON({ flattenMaps: true });
+  const { team: _team, __v, ...data } = doc.toJSON({ flattenMaps: true });
   return data as WebhookApiData;
 };
 
@@ -102,6 +122,15 @@ const emptyToUndefined = (
 ): Record<string, string> | undefined =>
   map && Object.keys(map).length > 0 ? map : undefined;
 
+const handleWebhookValidationError = (
+  err: unknown,
+  res: express.Response,
+): boolean => {
+  if (!isWebhookValidationError(err)) return false;
+  res.status(400).json({ message: err.message });
+  return true;
+};
+
 router.get(
   '/',
   validateRequest({
@@ -132,23 +161,6 @@ router.get(
   },
 );
 
-const httpHeaderNameValidator = z
-  .string()
-  .min(1, 'Header name cannot be empty')
-  .regex(
-    /^[!#$%&'*+\-.0-9A-Z^_`a-z|~]+$/,
-    "Invalid header name. Only alphanumeric characters and !#$%&'*+-.^_`|~ are allowed",
-  )
-  .refine(name => !name.match(/^\d/), 'Header name cannot start with a number');
-
-// Validation for header values: no control characters allowed
-const httpHeaderValueValidator = z
-  .string()
-  // eslint-disable-next-line no-control-regex
-  .refine(val => !/[\r\n\t\x00-\x1F\x7F]/.test(val), {
-    message: 'Header values cannot contain control characters',
-  });
-
 router.post(
   '/',
   validateRequest({
@@ -156,10 +168,12 @@ router.post(
       body: z.string().optional(),
       description: z.string().optional(),
       headers: z
-        .record(httpHeaderNameValidator, httpHeaderValueValidator)
+        .record(webhookHeaderNameSchema, webhookHeaderValueSchema)
         .optional(),
       name: z.string(),
-      queryParams: z.record(z.string()).optional(),
+      queryParams: z
+        .record(webhookQueryParamKeySchema, webhookQueryParamValueSchema)
+        .optional(),
       service: z.nativeEnum(WebhookService),
       url: z.string().url(),
     }),
@@ -176,26 +190,33 @@ router.post(
       }
       const { name, service, url, description, queryParams, headers, body } =
         req.body;
-      if (await Webhook.findOne({ team: teamId, service, url })) {
+      // The unique index is on (team, service, name), so the pre-flight check
+      // must query the same fields — otherwise a name+service collision slips
+      // past this guard and surfaces as an uncaught duplicate-key 500 below.
+      if (await Webhook.findOne({ team: teamId, service, name })) {
         return res.status(400).json({
           message: 'Webhook already exists',
         });
       }
-      const webhook = new Webhook({
-        team: teamId,
+      const webhook = await createWebhook(teamId, {
+        name,
         service,
         url,
-        name,
         description,
         queryParams,
         headers,
         body,
       });
-      await webhook.save();
       res.json({
         data: sanitizeWebhook(serializeWebhook(webhook)),
       });
     } catch (err) {
+      if (handleWebhookValidationError(err, res)) return;
+      // Backstop the pre-flight check against a concurrent create racing on the
+      // same (team, service, name): the unique index rejects it as a duplicate.
+      if (isDuplicateKeyError(err)) {
+        return res.status(400).json({ message: 'Webhook already exists' });
+      }
       next(err);
     }
   },
@@ -213,10 +234,12 @@ router.put(
       body: z.string().optional(),
       description: z.string().optional(),
       headers: z
-        .record(httpHeaderNameValidator, httpHeaderValueValidator)
+        .record(webhookHeaderNameSchema, webhookHeaderValueSchema)
         .optional(),
       name: z.string(),
-      queryParams: z.record(z.string()).optional(),
+      queryParams: z
+        .record(webhookQueryParamKeySchema, webhookQueryParamValueSchema)
+        .optional(),
       service: z.nativeEnum(WebhookService),
       url: z.string().url(),
     }),
@@ -266,6 +289,8 @@ router.put(
         });
       }
 
+      validateWebhookConfig({ service, url: resolvedUrl, body });
+
       // When the URL is changing, use submitted values as-is (no merge).
       // An omitted field becomes undefined → $unset, so stored secrets
       // are never silently carried over to a new destination.
@@ -277,15 +302,17 @@ router.put(
         ? emptyToUndefined(queryParams)
         : mergeRedactedMap(existingPlain.queryParams, queryParams);
 
+      // Match the unique index (team, service, name) so a rename onto an
+      // existing (service, name) is caught here rather than as a 500 below.
       const duplicateWebhook = await Webhook.findOne({
         team: teamId,
         service,
-        url: resolvedUrl,
+        name,
         _id: { $ne: id },
       });
       if (duplicateWebhook) {
         return res.status(400).json({
-          message: 'A webhook with this service and URL already exists',
+          message: 'A webhook with this service and name already exists',
         });
       }
 
@@ -334,6 +361,14 @@ router.put(
         data: sanitizeWebhook(serializeWebhook(updatedWebhook)),
       });
     } catch (err) {
+      if (handleWebhookValidationError(err, res)) return;
+      // Backstop the pre-flight check against a concurrent rename racing onto
+      // the same (team, service, name): the unique index rejects it.
+      if (isDuplicateKeyError(err)) {
+        return res.status(400).json({
+          message: 'A webhook with this service and name already exists',
+        });
+      }
       next(err);
     }
   },
@@ -354,7 +389,14 @@ router.delete(
       if (teamId == null) {
         return res.sendStatus(403);
       }
-      await Webhook.findOneAndDelete({ _id: req.params.id, team: teamId });
+
+      const result = await deleteWebhook(teamId, req.params.id);
+      if (result.status === 'referenced') {
+        return res.status(409).json({
+          message: `Cannot delete webhook: ${result.alertCount} alert(s) still reference it. Please update or remove those alerts first.`,
+        });
+      }
+      // Respond 200 even on a missing id, preserving the prior behavior here.
       res.json({});
     } catch (err) {
       next(err);
@@ -368,9 +410,11 @@ router.post(
     body: z.object({
       body: z.string().optional(),
       headers: z
-        .record(httpHeaderNameValidator, httpHeaderValueValidator)
+        .record(webhookHeaderNameSchema, webhookHeaderValueSchema)
         .optional(),
-      queryParams: z.record(z.string()).optional(),
+      queryParams: z
+        .record(webhookQueryParamKeySchema, webhookQueryParamValueSchema)
+        .optional(),
       service: z.nativeEnum(WebhookService),
       url: z.string().url(),
       webhookId: z
@@ -411,6 +455,8 @@ router.post(
         }
       }
 
+      validateWebhookConfig({ service, url, body });
+
       // Create a temporary webhook object for testing
       const testWebhook = new Webhook({
         team: new ObjectId(teamId),
@@ -421,24 +467,45 @@ router.post(
         body,
       });
 
-      // Send test message
-      const testMessage = {
+      // Every field a real firing sends, so a body written against the
+      // documented variables renders here exactly as it will in production.
+      // The enriched variables especially: `threshold`, `thresholdMax` and
+      // `value` are emitted raw, so leaving them unset renders `"value": `
+      // and the receiver rejects a template that would have worked.
+      // A range comparator is the useful sample — it is the one case where
+      // `thresholdMax` is populated.
+      const now = Date.now();
+      const testMessage: Message = {
         hdxLink: 'https://hyperdx.io',
         title: 'Test Webhook from HyperDX',
         body: 'This is a test message to verify your webhook configuration is working correctly.',
-        startTime: Date.now(),
-        endTime: Date.now(),
-        state: AlertState.INSUFFICIENT_DATA,
+        startTime: now - ms('5m'),
+        endTime: now,
+        state: AlertState.ALERT,
         eventId: 'test-event-id',
+        alertId: 'test-alert-id',
+        status: ALERT_STATUS_BY_STATE[AlertState.ALERT],
+        alertType: ALERT_TYPE_BY_SOURCE[AlertSource.SAVED_SEARCH],
+        comparator: COMPARATOR_BY_THRESHOLD_TYPE[AlertThresholdType.BETWEEN],
+        threshold: 5,
+        thresholdMax: 10,
+        value: 7,
+        groupKey: 'test-group',
+        groupValues: { group: 'test-group' },
+        sourceQuery: 'SeverityText: "error"',
+        teamId: teamId.toString(),
+        note: 'Test webhook — no runbook',
       };
 
+      const testChannel = { type: 'webhook' as const, channel: testWebhook };
+
       if (service === WebhookService.Slack) {
-        await handleSendSlackWebhook(testWebhook, testMessage);
+        await handleSendSlackWebhook(testChannel, testMessage);
       } else if (
         service === WebhookService.Generic ||
         service === WebhookService.IncidentIO
       ) {
-        await handleSendGenericWebhook(testWebhook, testMessage);
+        await handleSendGenericWebhook(testChannel, testMessage);
       } else {
         return res.status(400).json({
           message: 'Unsupported webhook service type',
@@ -449,6 +516,7 @@ router.post(
         message: 'Test webhook sent successfully',
       });
     } catch (err) {
+      if (handleWebhookValidationError(err, res)) return;
       next(err);
     }
   },

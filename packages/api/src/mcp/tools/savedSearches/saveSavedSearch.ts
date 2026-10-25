@@ -1,6 +1,3 @@
-import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
-import mongoose from 'mongoose';
-
 import * as config from '@/config';
 import {
   createSavedSearch,
@@ -8,52 +5,54 @@ import {
   updateSavedSearch,
 } from '@/controllers/savedSearch';
 import { getSource } from '@/controllers/sources';
+import { UPSERT_TOOL } from '@/mcp/tools/annotations';
+import type { ToolRegistrar } from '@/mcp/tools/types';
+import {
+  mcpServerError,
+  mcpUserError,
+  validateObjectId,
+} from '@/mcp/utils/errors';
 
-import { withToolTracing } from '../../utils/tracing';
-import type { McpContext } from '../types';
 import { mcpSaveSavedSearchSchema } from './schemas';
 
-export function registerSaveSavedSearch(
-  server: McpServer,
-  context: McpContext,
-): void {
+export function registerSaveSavedSearch({
+  context,
+  registerTool,
+}: ToolRegistrar): void {
   const { teamId, userId } = context;
   const frontendUrl = config.FRONTEND_URL;
 
-  server.registerTool(
-    'hyperdx_save_saved_search',
+  registerTool(
+    'clickstack_save_saved_search',
     {
       title: 'Create or Update Saved Search',
+      annotations: UPSERT_TOOL,
       description:
         'Create a new saved search (omit id) or update an existing one (provide id). ' +
-        'A saved search stores a reusable query against a data source. ' +
-        'Use hyperdx_list_sources to find the sourceId.',
+        'A saved search stores a reusable query (select, where, orderBy, filters) ' +
+        'against a data source. Use clickstack_list_sources to find the sourceId.\n\n' +
+        'UPDATES REPLACE FIELDS, they do not merge: name, sourceId, select, where, and ' +
+        'tags are overwritten, and omitted select/where/tags are reset to empty. ' +
+        'Omitted whereLanguage, orderBy, and filters keep their stored values. To ' +
+        'change one field, read the saved search with clickstack_get_saved_search ' +
+        'and resend everything you want to keep.\n\n' +
+        'Alerts can be attached to a saved search and evaluate its current query, ' +
+        'so changing where, select, or sourceId changes what those alerts check.',
       inputSchema: mcpSaveSavedSearchSchema,
     },
-    withToolTracing('hyperdx_save_saved_search', context, async input => {
+    async input => {
       const isUpdate = !!input.id;
 
       // ── Validate ID for updates ──
-      if (isUpdate && !mongoose.Types.ObjectId.isValid(input.id!)) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: 'Invalid saved search ID' }],
-        };
+      if (isUpdate) {
+        const idError = validateObjectId(input.id!, 'saved search ID');
+        if (idError) return idError;
       }
 
-      // ── Validate sourceId ──
-      if (!mongoose.Types.ObjectId.isValid(input.sourceId)) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: 'Invalid sourceId' }],
-        };
-      }
+      // ── Validate sourceId (format validated by Zod schema, check existence) ──
       const source = await getSource(teamId, input.sourceId);
       if (!source) {
-        return {
-          isError: true,
-          content: [{ type: 'text' as const, text: 'Source not found' }],
-        };
+        return mcpUserError('Source not found');
       }
 
       // Build the saved search data matching what the controller expects.
@@ -61,7 +60,9 @@ export function registerSaveSavedSearch(
         name: input.name,
         select: input.select ?? '',
         where: input.where ?? '',
-        whereLanguage: input.whereLanguage,
+        // Alerts read a missing whereLanguage as sql while the app reads it as
+        // lucene, so a new search must store it explicitly.
+        whereLanguage: input.whereLanguage ?? (isUpdate ? undefined : 'lucene'),
         orderBy: input.orderBy,
         source: input.sourceId,
         tags: input.tags ?? [],
@@ -72,12 +73,7 @@ export function registerSaveSavedSearch(
         // Verify the saved search exists before updating.
         const existing = await getSavedSearch(teamId, input.id!);
         if (!existing) {
-          return {
-            isError: true,
-            content: [
-              { type: 'text' as const, text: 'Saved search not found' },
-            ],
-          };
+          return mcpUserError('Saved search not found');
         }
 
         const updated = await updateSavedSearch(
@@ -88,15 +84,7 @@ export function registerSaveSavedSearch(
         );
 
         if (!updated) {
-          return {
-            isError: true,
-            content: [
-              {
-                type: 'text' as const,
-                text: 'Failed to update saved search',
-              },
-            ],
-          };
+          return mcpServerError('Failed to update saved search');
         }
 
         return {
@@ -138,6 +126,6 @@ export function registerSaveSavedSearch(
           },
         ],
       };
-    }),
+    },
   );
 }

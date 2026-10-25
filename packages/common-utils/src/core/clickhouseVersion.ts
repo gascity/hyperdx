@@ -85,6 +85,25 @@ const DIRECT_READ_MAP_BACKPORT_MINS: ReadonlyArray<ClickHouseVersion> = [
 ];
 
 /**
+ * Per-branch minimum versions required for the direct_read map column
+ * optimization on ClickHouse Cloud. Cloud has its own release cadence and
+ * received the backport at different cutoffs than self-hosted:
+ *
+ *   - 26.2 branch → first available at 26.2.1.307
+ *   - 26.3 branch → automatically supported (any 26.3.x on Cloud)
+ *   - 26.4 branch → first available at 26.4.1.1740
+ *   - 26.5+       → always supported (inherits `DIRECT_READ_MAP_BASELINE`)
+ *
+ * The 26.3 entry sits at the floor of the branch so every 26.3.x.y version
+ * passes the per-branch comparison.
+ */
+const DIRECT_READ_MAP_CLOUD_BACKPORT_MINS: ReadonlyArray<ClickHouseVersion> = [
+  [26, 2, 1, 307],
+  [26, 3, 0, 0],
+  [26, 4, 1, 1740],
+];
+
+/**
  * First release where direct_read map support shipped unconditionally. Any
  * server with major.minor at or above this is considered supported, even if
  * its branch is not present in `DIRECT_READ_MAP_BACKPORT_MINS`.
@@ -95,9 +114,13 @@ const DIRECT_READ_MAP_BASELINE: ClickHouseVersion = [26, 5, 0, 0];
  * Returns true when the connected ClickHouse server supports the direct_read
  * map column optimization. Returns false when the version is undefined or
  * predates every known backport.
+ *
+ * When `isCloud` is true, uses the ClickHouse Cloud-specific backport cutoffs
+ * (which differ from self-hosted because Cloud ships its own release stream).
  */
 export function supportsDirectReadMap(
   version: ClickHouseVersion | undefined,
+  isCloud = false,
 ): boolean {
   if (!version) return false;
 
@@ -105,10 +128,56 @@ export function supportsDirectReadMap(
     return true;
   }
 
+  const branchMins = isCloud
+    ? DIRECT_READ_MAP_CLOUD_BACKPORT_MINS
+    : DIRECT_READ_MAP_BACKPORT_MINS;
+
   const [vMajor, vMinor] = version;
-  const branchMin = DIRECT_READ_MAP_BACKPORT_MINS.find(
+  const branchMin = branchMins.find(
     ([major, minor]) => major === vMajor && minor === vMinor,
   );
   if (!branchMin) return false;
   return compareClickHouseVersion(version, branchMin) >= 0;
+}
+
+/**
+ * First release shipping the `mergeTreeIndex(database, table)` table function.
+ * Landed in 24.2 (ClickHouse/ClickHouse#58140, reverted and un-reverted within
+ * the same cycle by #60428/#60435).
+ */
+const MERGE_TREE_INDEX_MIN: ClickHouseVersion = [24, 2, 0, 0];
+
+/**
+ * Pre-flight check only — the table function can still fail at query time
+ * (permissions, a non-MergeTree engine), so keep a fallback path.
+ */
+export function supportsMergeTreeIndex(
+  version: ClickHouseVersion | undefined,
+): boolean {
+  return isClickHouseVersionAtLeast(version, MERGE_TREE_INDEX_MIN);
+}
+
+/**
+ * First release that shipped the `mergeTreeTextIndex(database, table, index)`
+ * table function used to introspect text skip indices.
+ */
+const MERGE_TREE_TEXT_INDEX_MIN: ClickHouseVersion = [26, 3, 0, 0];
+
+/**
+ * Returns true when the connected ClickHouse server supports the
+ * `mergeTreeTextIndex` table function (>= 26.3). Returns false when the
+ * version is undefined or older.
+ */
+export function supportsMergeTreeTextIndex(
+  version: ClickHouseVersion | undefined,
+): boolean {
+  return isClickHouseVersionAtLeast(version, MERGE_TREE_TEXT_INDEX_MIN);
+}
+
+const PROMETHEUS_HTTP_API_MIN: ClickHouseVersion = [26, 6, 0, 0];
+
+export function supportsPrometheusHttpApi(
+  version: ClickHouseVersion | undefined,
+): boolean {
+  return isClickHouseVersionAtLeast(version, PROMETHEUS_HTTP_API_MIN);
 }
