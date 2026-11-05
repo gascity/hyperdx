@@ -7,7 +7,12 @@
 # - Mongo
 # - Otel Collector (otelcol)
 
-ARG NODE_VERSION=22.22
+# Pinned by digest: the multi-arch index of node:22.23.4-alpine3.24 (Node security
+# release for CVE-2026-111497 Brotli, plus the 22.23.4 TLS/DNS fixes). Bump
+# NODE_VERSION and NODE_DIGEST together; get the digest with
+# `crane digest node:<version>-alpine3.24`.
+ARG NODE_VERSION=22.23.4
+ARG NODE_DIGEST=sha256:fe4f6d74e20370acb04ad889077d14d0f64a9c8ea6a42bc60cddf1e844699914
 ARG CLICKHOUSE_VERSION=26.8
 ARG OTEL_COLLECTOR_VERSION=0.155.0
 ARG OTEL_COLLECTOR_CORE_VERSION=1.61.0
@@ -42,7 +47,7 @@ RUN go mod download
 COPY packages/otel-collector/ ./
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /migrate ./cmd/migrate
 
-FROM node:${NODE_VERSION}-alpine AS node_base
+FROM node:${NODE_VERSION}-alpine3.24@${NODE_DIGEST} AS node_base
 
 WORKDIR /app
 
@@ -104,7 +109,7 @@ RUN --mount=type=cache,target=/root/.yarn/berry/cache,id=yarn-cache \
 
 
 # prod ############################################################################################
-FROM node:${NODE_VERSION}-alpine AS prod
+FROM node:${NODE_VERSION}-alpine3.24@${NODE_DIGEST} AS prod
 
 LABEL org.opencontainers.image.vendor="HyperDX" \
       org.opencontainers.image.title="HyperDX Production" \
