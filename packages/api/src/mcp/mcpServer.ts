@@ -59,9 +59,16 @@ const SERVER_INFO: Implementation = {
   }),
 };
 
+// Upper bound on array elements + object members in one tools/call `arguments`
+// payload (GHSA-46jr-4wx8-v453): the SDK leaves it unlimited by default, which
+// lets one request exhaust the heap during validation. Model-generated tool
+// input stays orders of magnitude below this.
+export const MAX_TOOL_INPUT_ELEMENTS = 100_000;
+
 export function createServer(context: McpContext) {
   const server = new McpServer(SERVER_INFO, {
     instructions: SERVER_INSTRUCTIONS,
+    maxToolInputElements: MAX_TOOL_INPUT_ELEMENTS,
   });
 
   const registerTool = createRegisterTool(server, context);
